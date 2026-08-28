@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - /prompt: drive
+  - override /model: text_traj_vlm
+  - _self_
+
+model:
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    past_traj_sampling:
+      num_poses: 16
+      interval_length: 0.25
+    pred_traj_sampling:
+      num_poses: 5
+      interval_length: 1.0
+
+prompt:
+  use_cot: false
+
+train_stage:
+  optim_cfg:
+    optimizer:
+      lr: 1.0e-4
+
+  lora_cfg:
+    r: 16
+    lora_alpha: 32
+    target_modules: all-linear
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+logging:
+  version: sft_text_traj_vlm
+
+data:
+  drop_cfg:
+    past_traj: 0.2
+
+  image:
+    height: 544
+    width: 480

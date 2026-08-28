@@ -1,0 +1,32 @@
+defaults:
+  - dataset@data.val_dataset: waymo
+  - model: text_traj_vlm
+  - img_transform: default
+  - train_stage: supervised_train
+  - trainer: default
+  - _self_
+
+logging:
+  disable_comet: true
+  version: default_testing
+  comet_workspace: ${oc.env:COMET_WORKSPACE,null}
+  comet_project_name: ${oc.env:COMET_PROJECT_NAME,null}
+  comet_api_key: ${oc.env:COMET_API_KEY,null}
+
+data:
+  image:
+    height: 544
+    width: 480
+
+  val_dataset:
+    split: test
+
+  train_val_split: null
+  val_subset_path: null
+  reasoning_traces_path: null
+  save_path: ${oc.env:OUTPUT_DIR,outputs}
+
+  dataloader_args:
+    batch_size: 32
+    num_workers: 16
+    pin_memory: true

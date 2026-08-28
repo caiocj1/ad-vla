@@ -1,0 +1,25 @@
+_target_: ad_vla.train_stages.supervised_train_module.SupervisedTrainModule
+
+
+optim_cfg:
+  # Optional per-branch learning rates. Null preserves the original optimizer setup.
+  parameter_group_lrs: null
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-5
+  
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: null
+
+  lr_interval: step
+
+val_log_every_n_steps: 5
+
+lora_cfg: null
+
+# Optional nn.Module instantiated by the train stage with `model=...`.
+aux_head: null
+aux_loss_weight: 1.0
+aux_warmup_steps: null

@@ -1,0 +1,6 @@
+_target_: ad_vla.dataset.waymo.waymo_dataset.WaymoE2EDataset
+root: ${oc.env:WAYMO_INDEX_PATH, ???}
+
+img_transform: ${img_transform}
+
+sensors: "all_cams"

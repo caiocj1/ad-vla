@@ -1,0 +1,18 @@
+_target_: ad_vla.models.instantiate_model.instantiate_model
+class_path: ad_vla.models.text_traj_vlm.TextTrajVLM
+init_mode: auto
+ckpt_path: null
+
+
+model_args:
+  vlm_name_or_path: Qwen/Qwen3.5-2B
+  past_traj_sampling:
+    num_poses: 16
+    interval_length: 0.25
+  pad_missing_past_traj: false
+  pred_traj_sampling:
+    num_poses: 5
+    interval_length: 1.0
+  prompt_cfg: ${prompt}
+  camera_sequence: ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"]
+  num_past_image_frames: 1

@@ -1,0 +1,21 @@
+_target_: ad_vla.dataset.physical_ai.physical_ai_dataset.PhysicalAIDataset
+root: null # Dataset already handles cache dir
+
+img_transform: ${img_transform}
+
+sensors: front_four_tele  # 4 front cameras including real tele
+
+# Clip IDs resolved via {root}/{split}.parquet or .txt; falls back to all clips
+# For cached training subsets, point this at the generated train_clip_ids.txt
+# or manifest.json while keeping root as the PhysicalAI/HF cache directory.
+clip_ids_path: null
+stream: true
+revision: null
+include_future: true
+t0_us: 5100000        # 5.1s into each clip
+# Optional list of t0 timestamps. If set, every clip yields one sample per t0.
+sample_t0_us: null
+num_history_steps: 16  # 1.6s history @ 10Hz
+num_future_steps: 64   # 6.4s future @ 10Hz
+num_frames: 4          # 4 video frames per camera
+max_video_readers: 32

@@ -1,0 +1,81 @@
+defaults:
+  - dataset@data.train_dataset: waymo   # mounted at data.train_dataset
+  - dataset@data.val_dataset: waymo     # mounted at data.val_dataset
+  - model: mlp
+  - img_transform@train_img_transform: default
+  - img_transform@val_img_transform: default
+  - train_stage: supervised_train
+  - trainer: default
+  - _self_
+
+logging:
+  disable_comet: true
+  version: default_training
+  comet_workspace: ${oc.env:COMET_WORKSPACE,null}
+  comet_project_name: ${oc.env:COMET_PROJECT_NAME,null}
+  comet_api_key: ${oc.env:COMET_API_KEY,null}
+
+data:
+  image:
+    height: 544
+    width: 480
+
+  train_dataset:
+    split: train
+    img_transform: ${train_img_transform}
+  val_dataset:
+    split: val
+    img_transform: ${val_img_transform}
+
+  train_val_split: null # float in [0, 1], used only if train and val datasets are from the same split of the same dataset, to split them into proper train/val subsets
+  train_subset_path: null
+  val_subset_path: null
+  reasoning_traces_path: null
+  drop_cfg: null  # e.g. {intent: 0.3, past_traj: 0.1} to randomly drop inputs during training
+  save_path: ${oc.env:OUTPUT_DIR,outputs}
+
+  train_dataloader_args:
+    batch_size: 4
+    num_workers: 4
+    prefetch_factor: 2
+    pin_memory: true
+    persistent_workers: false
+
+  # Validation runs in the rank process to avoid forking workers after CUDA,
+  # DDP, and the training worker pool are already active.
+  val_dataloader_args:
+    batch_size: 4
+    num_workers: 0
+    pin_memory: true
+    persistent_workers: false
+
+  # TRAINING AND VALIDATING WITH QA SAMPLES:
+  qa_probability: 0.0 # Eligible nuScenes rows use one tied QA instead of driving supervision with p.
+  nuscenes_qa_annotations_path: null # Optional convenience path used by the nuScenes child of the concat dataset.
+  qa_val_dataset: null # Optional second validation dataset. It is flattened to one item per QA pair; null preserves the existing trajectory-only validation path.
+  qa_val_max_questions: 1000 # A fixed random subset keeps periodic QA generation practical and reproducible. Set to null to evaluate every question.
+  qa_val_subset_seed: 0
+  qa_val_dataloader_args:
+    batch_size: 4
+    num_workers: 0
+    pin_memory: true
+    persistent_workers: false
+
+trainer:
+  # training
+  accumulate_grad_batches: 4 # default: global batch size 64 = (4 gpus) * (4 samples/gpu) * (4 accumulate grad steps)
+
+  # evaluating
+  val_check_interval: 1000 # evaluates every 1000 batches (not steps)
+
+  # saving: latest checkpoint only
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+      monitor: step
+      mode: max
+      save_weights_only: true
+      save_top_k: 1
+      save_on_train_epoch_end: false
+      dirpath: ${data.save_path}/${logging.version}/checkpoints
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: step

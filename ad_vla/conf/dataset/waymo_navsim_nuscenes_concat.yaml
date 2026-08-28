@@ -1,0 +1,36 @@
+_target_: ad_vla.dataset.concat_dataset.E2EConcatDataset
+split: train
+img_transform: ${img_transform}
+
+# Optional per-child transforms can be mounted in an experiment as
+# /img_transform@waymo_train_img_transform,
+# /img_transform@navsim_train_img_transform, and
+# /img_transform@nuscenes_train_img_transform. If omitted, the concat wrapper
+# applies the parent img_transform to child datasets without their own transform.
+datasets:
+  - _target_: ad_vla.dataset.waymo.waymo_dataset.WaymoE2EDataset
+    root: ${oc.env:WAYMO_INDEX_PATH, ???}
+    split: train
+    img_transform: ${oc.select:waymo_train_img_transform,null}
+    sensors: "all_cams"
+    reasoning_traces_path: ${data.reasoning_traces_path}
+
+  - _target_: ad_vla.dataset.navsim.navsim_dataset.NAVSIMDataset
+    root: ${oc.env:OPENSCENE_DATA_ROOT, ???}
+    split: train
+    img_transform: ${oc.select:navsim_train_img_transform,null}
+    sensors: "all_cams"
+    frame_interval: 2
+    reasoning_traces_path: ${data.reasoning_traces_path}
+
+  - _target_: ad_vla.dataset.nuscenes.nuscenes_dataset.NuScenesDataset
+    root: ${oc.env:NUSCENES_ROOT, ???}
+    split: train
+    img_transform: ${oc.select:nuscenes_train_img_transform,null}
+    sensors: "all_cams"
+    num_past_steps: 8
+    num_future_steps: 10
+    require_full_past: true
+    require_full_future: true
+    reasoning_traces_path: ${data.reasoning_traces_path}
+    qa_annotations_path: null

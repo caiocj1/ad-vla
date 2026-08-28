@@ -1,0 +1,10 @@
+_target_: ad_vla.dataset.navsim.navsim_dataset.NAVSIMDataset
+root: ${oc.env:OPENSCENE_DATA_ROOT, ???}
+
+img_transform: ${img_transform}
+
+sensors: "all_cams"
+
+frame_interval: 2
+num_history_frames: 9 # to make past consistent with other datasets
+num_future_frames: 10
