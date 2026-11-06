@@ -44,13 +44,22 @@ SKIP_NAVSIM = pytest.mark.skipif(
     not OPENSCENE_DATA_ROOT or not os.path.isdir(OPENSCENE_DATA_ROOT),
     reason="OPENSCENE_DATA_ROOT not set or directory does not exist.",
 )
+
+
+def _has_hf_token() -> bool:
+    """PhysicalAI-AV and KITScenes are gated on the Hugging Face Hub: reading them needs a token."""
+    from huggingface_hub import get_token
+
+    return bool(get_token())
+
+
 SKIP_PHYSICAL_AI = pytest.mark.skipif(
-    not PHYSICAL_AI_ROOT,
-    reason="Neither PHYSICAL_AI_CACHE_DIR nor HF_HOME is set.",
+    not PHYSICAL_AI_ROOT or not _has_hf_token(),
+    reason="Needs PHYSICAL_AI_CACHE_DIR or HF_HOME, and HF_TOKEN (gated dataset).",
 )
 SKIP_KITSCENES = pytest.mark.skipif(
-    not KITSCENES_ROOT,
-    reason="Neither KITSCENES_CACHE_DIR nor HF_HOME is set.",
+    not KITSCENES_ROOT or not _has_hf_token(),
+    reason="Needs KITSCENES_CACHE_DIR or HF_HOME, and HF_TOKEN (gated dataset).",
 )
 SKIP_NUSCENES = pytest.mark.skipif(
     not NUSCENES_ROOT or not os.path.isdir(NUSCENES_ROOT),

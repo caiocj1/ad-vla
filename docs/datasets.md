@@ -124,8 +124,9 @@ on the Hugging Face Hub. Accept its terms there, and set `HF_TOKEN`. It is read 
 ## KITScenes
 
 The adapter loads [KIT-MRT/KITScenes-LongTail](https://huggingface.co/datasets/KIT-MRT/KITScenes-LongTail)
-with `datasets.load_dataset`, so it downloads into the Hugging Face cache on first use. It is used
-for evaluation; testing writes KITScenes-style predictions under `kit_subs/`.
+with `datasets.load_dataset`, so it downloads into the Hugging Face cache on first use. It is gated:
+accept its terms on the Hub and set `HF_TOKEN`. It is used for evaluation; testing writes
+KITScenes-style predictions under `kit_subs/`.
 
 ## NuPlanQA
 

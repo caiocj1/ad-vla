@@ -38,7 +38,7 @@ variables with `${oc.env:NAME}`. `.env.example` lists every variable with a comm
 - `HF_HOME`: the Hugging Face cache. Qwen3.5-2B (about 5 GB) downloads there on the first run.
 - The roots of the datasets you use, and the derived files your experiment refers to. See
   [datasets.md](datasets.md).
-- `HF_TOKEN`, only for gated models and datasets such as PhysicalAI-AV.
+- `HF_TOKEN`, only for gated models and datasets such as PhysicalAI-AV and KITScenes.
 
 ## Check the installation
 
@@ -50,7 +50,8 @@ uv run pytest tests -m dataset_integration                                    # 
 
 The GPU integration tests swap the backbone for `tiny-random/qwen3.5` from the Hugging Face Hub and
 train each model for a few steps on generated samples. Without Hub access they skip. The dataset
-tests skip the datasets whose root variable isn't set.
+tests skip the datasets whose root variable isn't set, and the gated Hub datasets (PhysicalAI-AV,
+KITScenes) without `HF_TOKEN`.
 
 ## Changing the stack
 
