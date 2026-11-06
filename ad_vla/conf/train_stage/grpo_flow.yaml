@@ -1,0 +1,81 @@
+# Flow-GRPO on a flow-matching action expert (FM-VLA, sampler=sde): GRPOModule with the model's per-denoising-step
+# log-probs (fm_vla.py grpo_policy_terms) instead of token re-scoring.
+_target_: ad_vla.train_stages.grpo_module.GRPOModule
+
+optim_cfg:
+  parameter_group_lrs: null
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-5
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: null
+  lr_interval: step
+
+lora_cfg: null
+
+num_traj_samples_per_gpu: 16  # group size = num_gpus * num_traj_samples (the expert shares one backbone pass)
+
+# Training rollouts: Flow-GRPO's marginal-preserving SDE from random noise.
+generate_cfg:
+  sampler: sde
+  # Sweep on a small set of states: more steps shrink the last, uncorrected
+  # noise (step std ~ a * dt near t = 1) at about the same within-group reward spread; 40 steps / a = 0.5 keeps
+  # comfort passes at 50 % (10 steps / a = 0.7, Flow-GRPO's image setting: 5 %) and collisions at 0.8 %.
+  # FlowGRPO-v4-r1: 10 steps (Flow-GRPO's training chain, closer to the 4-step deployment), a kept at 0.5
+  # (v1-v3: 40 steps).
+  noise_level: 0.5   # a in sigma_t = a sqrt((1 - t) / t)
+  sde_steps: 10      # denoising steps of the training chain (deployment: 4-step zero-init ODE)
+  num_eval_samples: 1  # raw samples (the checkpoint's diff_cfg may average several)
+
+# Validation: the deployment sampling (deterministic zero init, 4 Euler steps).
+val_generate_cfg:
+  sampler: ode
+  eval_init: zero
+  num_eval_samples: 1
+  num_inference_steps: 4
+
+# Probe of fixed held-out states with the deployment plans (GRPOModule.run_probe); set by the experiment.
+# Keys: dataset, batch_size, num_workers, every_n_batches, extra_reward_fns ({name: reward config}: the plans
+# are also scored with these, logged as probe/reward_<name>). Probe and viz need a SimPDMReward-like reward
+# (score + target_sampling), checked when GRPOModule is built.
+probe_cfg: null
+# Images (ad_vla/utils/grpo_viz.py; Comet images + PNGs in save_dir): bird's-eye views of the first
+# num_train_states training groups every every_n_batches batches (the G samples coloured by reward), and of
+# num_probe_states fixed probe states (G samples + deployment plan) at every probe pass. null: off.
+viz_cfg:
+  every_n_batches: 250
+  num_train_states: 1
+  num_probe_states: 20
+  probe_chunk: 5        # probe states per sampling call
+  save_dir: ${data.save_path}/${logging.version}/viz
+
+rl_cfg:
+  normalize_by_std: true
+  kl_beta: 0.04        # closed-form per-step KL to the frozen initial expert (Flow-GRPO's other setting; v1-v3: 0.01,
+                       # under which v3-r1's probe gains came by step ~31 and the rest was drift)
+  reward_scale: 1.0
+  window_size: 50
+  clip_range: 0.2      # PPO clip of the per-step ratio; ~inactive here (one update per rollout batch: ratio ~1,
+                       # see grpo.yaml), so v4-v12 effectively trained the group-baseline policy gradient + KL
+  adv_clip_max: 5.0
+  adv_std_floor: null  # group-std floor of the advantage normalization (FlowGRPO-Mix-v10 only; see grpo.yaml)
+  step_fraction: 1.0   # loss on all 10 denoising steps per batch (Flow-GRPO timestep_fraction; v1-v3: 25 % of 40,
+                       # the same 10 trained steps per batch)
+  reward_fn:
+    _target_: ad_vla.rewards.sim_pdm_reward.SimPDMReward
+    num_poses: 20
+    interval_length: 0.25
+    smooth: poly
+    # PDM-style weights; NC is binary and TTC on (graded NC + no TTC -> faster plans, more collisions).
+    w_ep: 5.0
+    w_ttc: 5.0
+    w_pk: 5.0
+    w_c: 2.0
+    ttc_horizon_s: 1.0
+    ep_reference: human  # EP = progress / human progress in the horizon (group-relative EP -> faster plans)
+    # FlowGRPO-v4-r1 (after v3-r1: probe off-road 22 -> 20 % only, plans 1.21 -> 1.29 x the human):
+    dac_mode: binary     # any off-road pose zeroes the reward (v1-v3: graded fraction of poses)
+    ep_over_ratio: 1.1   # EP falls beyond max(1.1 x human, human + 2 m), to 0 at 0.4 x human further
+    ep_over_margin_m: 2.0
+    ep_over_ramp: 0.4

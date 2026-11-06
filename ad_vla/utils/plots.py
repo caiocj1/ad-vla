@@ -156,10 +156,10 @@ def plot_pred_in_cam(
     pred_traj = pred_traj.cpu().numpy() if pred_traj is not None else None
     fut_traj = fut_traj.cpu().numpy() if fut_traj is not None else None
 
-    # Layout: 4-panel when both CoTs, 3-panel when only pred_cot, 2-panel otherwise
+    # Layout: 4-panel when both CoTs, 3-panel when only one, 2-panel otherwise
     if pred_cot is not None and gt_cot is not None:
         fig, ax = plt.subplot_mosaic("AA\nBC\nBD", figsize=(10, 14))
-    elif pred_cot is not None:
+    elif pred_cot is not None or gt_cot is not None:
         fig, ax = plt.subplot_mosaic("AA\nBC", figsize=(10, 10))
     else:
         fig, ax = plt.subplot_mosaic("AAB", figsize=(13, 5))

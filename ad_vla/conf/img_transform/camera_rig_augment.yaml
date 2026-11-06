@@ -1,0 +1,16 @@
+_target_: ad_vla.utils.img_utils.CameraRigAugment
+
+
+p_geometry: 0.75
+max_crop_ratio: 0.10
+max_yaw_deg: 3.0
+max_pitch_deg: 2.0
+max_roll_deg: 1.0
+
+p_color: 0.80
+brightness: 0.15
+contrast: 0.15
+saturation: 0.15
+hue: 0.03
+
+padding_mode: border

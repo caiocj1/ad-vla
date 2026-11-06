@@ -1,0 +1,34 @@
+name: drive_nearby_obj_det_cot
+
+past_num_poses: ${model.model_args.past_traj_sampling.num_poses}
+past_interval: ${model.model_args.past_traj_sampling.interval_length}
+pred_num_poses: ${model.model_args.pred_traj_sampling.num_poses}
+pred_interval: ${model.model_args.pred_traj_sampling.interval_length}
+
+use_cot: true
+
+intro: "You are an expert driver.\nInput:"
+
+input_sections:
+  images: "- 1 frame of multi-view images collected from the ego-vehicle at the present timestep"
+  past_traj: "- past trajectory (${prompt.past_num_poses} steps, ${prompt.past_interval}s intervals)"
+  intent: "- Current high-level intent (string)"
+
+task_text: |
+  Task: Future Trajectory Prediction
+  Given the input, predict the optimal future trajectory (${prompt.pred_num_poses} steps, ${prompt.pred_interval}s intervals) of the ego vehicle.
+  Output format (raw text, not markdown or LaTeX):
+  Future ego trajectory:[[x_1, y_1], [x_2, y_2], ..., [x_${prompt.pred_num_poses}, y_${prompt.pred_num_poses}]]
+
+task_text_cot: |
+  Task 1: Nearby Object Detection
+  Based on the camera images, you must identify the up to five objects closest to the ego-vehicle in the near future.
+  Each critical object is identified by their type (e.g. vehicle, pedestrian, bycicle, traffic cone, etc), their relative closeness, starting from the closest object, and their (x, y) coordinate in the ego reference frame.
+  Output format (Python dict, no extra keys, no commentary):
+  Nearby objects:{'object_1': [[x, y]], 'object_2': [[x, y]], ..., 'object_5': [[x, y]]}
+  If there are no objects nearby, output an empty dict:
+  Nearby objects:{}
+  Task 2: Future Trajectory Prediction
+  Given the input, predict the optimal future trajectory (${prompt.pred_num_poses} steps, ${prompt.pred_interval}s intervals) of the ego vehicle.
+  Output format (raw text, not markdown or LaTeX):
+  Future ego trajectory:[[x_1, y_1], [x_2, y_2], ..., [x_${prompt.pred_num_poses}, y_${prompt.pred_num_poses}]]

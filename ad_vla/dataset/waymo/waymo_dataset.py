@@ -12,7 +12,14 @@ import_tf_silent()
 import tensorflow as tf
 
 from ad_vla.dataset.base_dataset import BaseDataset
-from ad_vla.dataset.data_types import E2EDataSample, TrajectorySampling
+from ad_vla.dataset.intent_labels import load_intent_table
+from ad_vla.dataset.data_types import (
+    E2EDataSample,
+    QuestionAnswerPair,
+    TrajectorySampling,
+)
+from ad_vla.dataset.waymo.waymo_qa import load_waymo_qa
+from ad_vla.utils.intent_utils import intent7_from_path
 from ad_vla.dataset.waymo.waymo_types import (
     WAYMO_IDX2CAM,
     WAYMO_INTENT_DICT,
@@ -48,6 +55,12 @@ class WaymoE2EDataset(BaseDataset):
         sensors: str = "front_cam_only",
         img_transform: torch.nn.Module | None = None,
         reasoning_traces_path: str | None = None,
+        num_past_frames: int = 0,
+        past_frame_stride: int = 5,
+        clip_index_path: str | None = None,
+        qa_annotations_path: str | None = None,
+        agent_boxes_path: str | None = None,
+        intent_labels_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Waymo E2E dataset.
@@ -59,8 +72,24 @@ class WaymoE2EDataset(BaseDataset):
             img_transform: Optional image transform applied to each camera image.
             reasoning_traces_path: Optional directory with ``*_annotations.jsonl``
                 files containing reasoning traces.
+            agent_boxes_path: Optional ``AgentBoxStore`` directory with detections and tracks.
+            num_past_frames: Past timesteps added to ``sample.cameras``, oldest first. Near the
+                start of a clip the list is shorter; frames are never repeated.
+            past_frame_stride: Spacing of past frames, in 10 Hz frames (5 = 0.5 s).
+            intent_labels_path: Table of 7-class intents keyed by dataset index
+                (``ad_vla.dataset.intent_labels``), used instead of the official intent.
+            clip_index_path: Pickle from ``build_waymo_clip_index.py``, required if
+                ``num_past_frames > 0`` or ``qa_annotations_path`` is set.
+            qa_annotations_path: Waymo QA JSONL file, attached to ``sample.qa_pairs``.
         """
-        super().__init__(root, split, sensors, img_transform, reasoning_traces_path)
+        super().__init__(
+            root,
+            split,
+            sensors,
+            img_transform,
+            reasoning_traces_path,
+            agent_boxes_path=agent_boxes_path,
+        )
 
         # Resolve standard camera names via central config
         self.standard_cameras = set(self._resolve_cameras(_WAYMO_AVAILABLE_CAMS))
@@ -75,8 +104,63 @@ class WaymoE2EDataset(BaseDataset):
 
         self.file_handles = {}
 
+        self.intent_table = load_intent_table(intent_labels_path, by_index=True)
+        if self.intent_table is not None:
+            print(self.intent_table.report(f"Waymo {split}", range(len(self.index))))
+
         self.sampling_freq = 4
         self.teacher_image_size = (1072, 976)
+
+        self.qa_by_index, self._qa_index_by_scenario, self.qa_dropped = {}, {}, 0
+        if qa_annotations_path is not None:
+            self.qa_by_index, self._qa_index_by_scenario, self.qa_dropped = (
+                load_waymo_qa(qa_annotations_path, split, clip_index_path)
+            )
+            print(
+                f"Waymo QA {split}: {sum(map(len, self.qa_by_index.values())):,} questions on "
+                f"{len(self.qa_by_index):,} frames, {self.qa_dropped} without a frame."
+            )
+
+        self.past_indices = None
+        if num_past_frames > 0:
+            if clip_index_path is None:
+                raise ValueError("num_past_frames > 0 needs clip_index_path")
+            self.past_indices = self._build_past_indices(
+                clip_index_path, num_past_frames, past_frame_stride
+            )
+
+    def qa_pairs_by_index(
+        self, strict: bool = False
+    ) -> dict[int, tuple[QuestionAnswerPair, ...]]:
+        """Questions of each sample. See the base class."""
+        if strict and self.qa_dropped:
+            raise ValueError(
+                f"{self.qa_dropped} QA annotations have no frame in Waymo {self.split}."
+            )
+        return self.qa_by_index
+
+    def _build_past_indices(
+        self, clip_index_path: str, num_past: int, stride: int
+    ) -> np.ndarray:
+        """Return [N, num_past] dataset indices of each sample's past frames, nearest first, -1 if absent."""
+        with open(clip_index_path, "rb") as f:
+            clips = pickle.load(f)
+        past_indices = np.full((len(self.index), num_past), -1, dtype=np.int32)
+        for frames in clips.values():
+            by_frame = dict(frames)
+            for frame, idx in frames:
+                for k in range(num_past):
+                    past_indices[idx, k] = by_frame.get(frame - (k + 1) * stride, -1)
+        return past_indices
+
+    def __getitem__(self, idx: int) -> E2EDataSample:
+        past_scenarios = []
+        if self.past_indices is not None:
+            for past_idx in self.past_indices[idx]:
+                if past_idx < 0:  # no older frames either: stop at the first gap
+                    break
+                past_scenarios.append(self._get_sample(int(past_idx)))
+        return self._clean_sample(self._get_sample(idx), past_scenarios[::-1], idx)
 
     def __len__(self) -> int:
         return len(self.index)
@@ -104,8 +188,14 @@ class WaymoE2EDataset(BaseDataset):
 
         return scenario
 
-    def _clean_sample(self, scenario: wod_e2ed_pb2.E2EDFrame) -> E2EDataSample:
-        """Reformat a Waymo proto into a valid ``E2EDataSample``."""
+    def _clean_sample(
+        self,
+        scenario: wod_e2ed_pb2.E2EDFrame,
+        past_scenarios: list[wod_e2ed_pb2.E2EDFrame] = (),
+        idx: int | None = None,
+    ) -> E2EDataSample:
+        """Reformat a Waymo proto into a valid ``E2EDataSample``; past scenarios are oldest first.
+        ``idx`` (the dataset index) looks up the intent table, when there is one."""
         info: dict[str, Any] = {}
 
         info["agent_input"] = {}
@@ -140,6 +230,18 @@ class WaymoE2EDataset(BaseDataset):
                 interval_length=1.0 / self.sampling_freq,
             )
 
+        if self.intent_table is not None:
+            table_intent = None if idx is None else self.intent_table.get(idx)
+            info["intent"] = table_intent or intent7_from_path(
+                info.get("fut_traj", np.zeros((0, 2))),
+                float(
+                    np.hypot(
+                        scenario.past_states.vel_x[-1], scenario.past_states.vel_y[-1]
+                    )
+                ),
+                official=info["intent"],
+            )
+
         info["metadata"] = {}
         info["metadata"]["scenario_id"] = scenario.frame.context.name
         info["metadata"]["sampling_freq"] = self.sampling_freq
@@ -164,15 +266,49 @@ class WaymoE2EDataset(BaseDataset):
                 ]
 
         # Process camera data — only keep resolved cameras
-        info["cameras"] = [{}]
-        info["teacher_cameras"] = [{}]
+        cameras, teacher_cameras = self._load_cameras(scenario, with_teacher=True)
+        info["cameras"] = [
+            self._load_cameras(p, with_teacher=False)[0] for p in past_scenarios
+        ]
+        info["cameras"].append(cameras)
+        info["teacher_cameras"] = [teacher_cameras]
+
+        if self.reasoning_trace_df is not None:
+            try:
+                reasoning_trace = self.reasoning_trace_df[
+                    self.reasoning_trace_df.scenario_id
+                    == info["metadata"]["scenario_id"]
+                ].text.item()
+                info["reasoning_trace"] = reasoning_trace
+            except ValueError:
+                info["reasoning_trace"] = None
+
+        qa_index = self._qa_index_by_scenario.get(info["metadata"]["scenario_id"])
+        if qa_index is not None:
+            info["qa_pairs"] = self.qa_by_index[qa_index]
+
+        stored_agents = self._stored_agent_info(info["metadata"]["scenario_id"])
+        if stored_agents is not None:
+            info["agent_info"] = stored_agents
+
+        return E2EDataSample(**info)
+
+    def _load_cameras(
+        self, scenario: wod_e2ed_pb2.E2EDFrame, with_teacher: bool
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Decode one frame's resolved cameras; teacher images only if ``with_teacher``."""
+        cameras: dict[str, Any] = {}
+        teacher_cameras: dict[str, Any] = {}
 
         image_list = []
         calibration_list = []
 
         for index, image_content in enumerate(scenario.frame.images):
-            # Decode the raw image string and convert to numpy type.
             calibration = scenario.frame.context.camera_calibrations[index]
+            # Skip decoding cameras outside the resolved set (JPEG decoding dominates loading).
+            if WAYMO_IDX2CAM[calibration.name] not in self.standard_cameras:
+                continue
+            # Decode the raw image string and convert to numpy type.
             image = tf.io.decode_image(image_content.image).numpy()
             image_list.append(image)
             calibration_list.append(calibration)
@@ -198,7 +334,7 @@ class WaymoE2EDataset(BaseDataset):
                 new_intrinsics[idx] = intrinsics[i]
             intrinsics = new_intrinsics
 
-            info["cameras"][-1][cam_name] = {}
+            cameras[cam_name] = {}
 
             raw_size = tuple(img.shape[:2])
             cal_dict = {
@@ -211,23 +347,13 @@ class WaymoE2EDataset(BaseDataset):
             }
 
             image = torch.tensor(img)
-            info["teacher_cameras"][-1][cam_name] = self._make_teacher_camera_data(
-                image,
-                cal_dict,
-            )
+            if with_teacher:
+                teacher_cameras[cam_name] = self._make_teacher_camera_data(
+                    image, cal_dict
+                )
 
-            image, cal_dict = self._apply_img_transform(image, cal_dict)
-            info["cameras"][-1][cam_name]["image"] = image
-            info["cameras"][-1][cam_name]["cal_dict"] = cal_dict
+            image, cal_dict = self._apply_img_transform(image, cal_dict, cam_name)
+            cameras[cam_name]["image"] = image
+            cameras[cam_name]["cal_dict"] = cal_dict
 
-        if self.reasoning_trace_df is not None:
-            try:
-                reasoning_trace = self.reasoning_trace_df[
-                    self.reasoning_trace_df.scenario_id
-                    == info["metadata"]["scenario_id"]
-                ].text.item()
-                info["reasoning_trace"] = reasoning_trace
-            except ValueError:
-                info["reasoning_trace"] = None
-
-        return E2EDataSample(**info)
+        return cameras, teacher_cameras

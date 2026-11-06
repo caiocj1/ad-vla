@@ -1,0 +1,74 @@
+# @package _global_
+
+# TextTrajVLM (Qwen3.5-2B, LoRA) on the v1_qa mix: driving on PhysicalAI, Waymo, NavSim and nuScenes
+# with the three front cameras, plus nuScenes QA (3 questions per frame and epoch) with all six.
+# Input: one image frame and the past 1.5 s (4 poses at 0.5 s) as text; output: 5 waypoints at 1 s,
+# as text. Validation: the Waymo rater subset (primary) and 1,000 PhysicalAI clips.
+# Its exported checkpoint is the frozen backbone of examples/sft_fm_vla.
+#
+#   python scripts/run_training.py +experiment=examples/sft_ttvlm_v1_qa
+#
+# Needs WAYMO_INDEX_PATH, OPENSCENE_DATA_ROOT, NUSCENES_ROOT, HF_HOME, ASSETS_DIR,
+# PHYSICAL_AI_TRAIN_CLIP_IDS and PHYSICAL_AI_VAL_CLIP_IDS (see .env.example).
+
+defaults:
+  - /prompt: drive_poutine
+  - /dataset_mix@data.train: v1_qa
+  - /dataset@data.val.waymo: waymo
+  - /dataset@data.val.physical_ai: physical_ai
+  - override /model: text_traj_vlm
+  - _self_
+
+model:
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    past_traj_sampling:
+      num_poses: 4
+      interval_length: 0.5
+    pred_traj_sampling:
+      num_poses: 5
+      interval_length: 1.0
+    pad_missing_past_traj: true
+
+prompt:
+  use_cot: false
+
+train_stage:
+  optim_cfg:
+    optimizer:
+      lr: 1.0e-4
+  lora_cfg:
+    r: 16
+    lora_alpha: 32
+    target_modules: all-linear
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+logging:
+  version: sft_ttvlm_v1_qa
+
+data:
+  drop_cfg:
+    past_traj: 0.2
+  primary_val: waymo
+  val:
+    waymo:
+      size: [608, 544]
+      sensors: front_three
+      subset: ${oc.env:ASSETS_DIR}/indices/waymo_pref_idx.pt
+    physical_ai:
+      size: [448, 768]
+      sensors: front_three
+      root: ${oc.env:HF_HOME}
+      clip_ids_path: ${oc.env:PHYSICAL_AI_VAL_CLIP_IDS}
+      stream: false
+      revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+      num_history_steps: 40
+      num_future_steps: 50
+      num_frames: 1
+  val_dataloader_args:
+    num_workers: 4
+
+trainer:
+  accumulate_grad_batches: 4  # with batch 4 on 4 GPUs: 64 samples per optimizer step

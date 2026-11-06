@@ -1,0 +1,18 @@
+# v1_qa_waymo: v1_qa plus Waymo QA, every question once per epoch. Needs prompt: drive_vqa.
+# QA uses all cameras: 8 on Waymo, the default of dataset/waymo.yaml. The rear ones are about half as
+# tall as the others, so they have their own size to keep their shape.
+defaults:
+  - v1_qa
+  - /dataset@waymo_qa: waymo
+  - _self_
+
+waymo_qa:
+  task: qa
+  questions_per_frame: null
+  size: [448, 416]
+  camera_sizes:
+    REAR_LEFT: [256, 416]
+    REAR: [256, 416]
+    REAR_RIGHT: [256, 416]
+  qa_annotations_path: ${oc.env:ASSETS_DIR}/annotations/waymo/train.jsonl
+  clip_index_path: ${oc.env:ASSETS_DIR}/indices/wod_e2e_train_clip_to_dataset_indices.pkl

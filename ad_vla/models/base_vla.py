@@ -26,7 +26,7 @@ class BaseVLAConfig(PretrainedConfig):
         self,
         vlm_name_or_path: str = "Qwen/Qwen3-VL-2B-Instruct",
         prompt_cfg: dict | None = None,
-        camera_sequence: list[str] = ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"],
+        camera_sequence: list[str] | None = None,
         num_past_image_frames: int = 1,
         concat_cameras: bool = True,
         pad_missing_past_traj: bool = False,
@@ -34,7 +34,12 @@ class BaseVLAConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
         self.vlm_name_or_path = vlm_name_or_path
-        self.camera_sequence = camera_sequence
+        # Default rig: the three front cameras (a fresh list, not a shared mutable default).
+        self.camera_sequence = (
+            list(camera_sequence)
+            if camera_sequence is not None
+            else ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"]
+        )
         self.num_past_image_frames = num_past_image_frames
         self.concat_cameras = concat_cameras
         self.pad_missing_past_traj = pad_missing_past_traj
@@ -50,10 +55,16 @@ class BaseVLAConfig(PretrainedConfig):
     def attn_implementation(self):
         return self._attn_implementation
 
+    # transformers>=5.12 assigns this during from_pretrained(..., attn_implementation=...).
+    @attn_implementation.setter
+    def attn_implementation(self, value):
+        self._attn_implementation = value
+
 
 class BaseVLA(PreTrainedModel):
     config_class = BaseVLAConfig
     _supports_flash_attn_2 = True
+    _supports_flash_attn = True  # name checked by transformers 5.x
     base_model_prefix = "vlm"
 
     def __init__(
@@ -123,7 +134,23 @@ class BaseVLA(PreTrainedModel):
         """Get the input embeddings of the model."""
         return self.vlm.language_model.embed_tokens
 
-    def tie_weights(self, **kwargs) -> None:
-        """Delegate weight tying to the nested VLM model."""
-        if hasattr(self.vlm, "tie_weights"):
+    def tie_weights(self, missing_keys: set[str] | None = None, **kwargs) -> None:
+        """Delegate weight tying to the nested VLM model.
+
+        During from_pretrained, transformers 5.x passes the checkpoint's missing
+        keys with this model's ``vlm.`` prefix, while the nested VLM names its
+        tied parameters without it. Strip the prefix so the VLM sees e.g.
+        ``lm_head.weight`` as missing and ties it instead of comparing it, still
+        on the meta device, against the loaded embeddings.
+        """
+        if not hasattr(self.vlm, "tie_weights"):
+            return
+        if missing_keys is None:
             self.vlm.tie_weights(**kwargs)
+            return
+        prefix = f"{self.base_model_prefix}."
+        vlm_missing = {k[len(prefix) :] for k in missing_keys if k.startswith(prefix)}
+        before = set(vlm_missing)
+        self.vlm.tie_weights(missing_keys=vlm_missing, **kwargs)
+        # Keys the VLM tied are no longer missing for this model either.
+        missing_keys.difference_update(prefix + k for k in before - vlm_missing)

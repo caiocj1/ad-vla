@@ -1,0 +1,16 @@
+# Hydra config for GPU integration tests.
+# Uses the real model / train_stage / prompt configs with a tiny backbone,
+# single-step trainer, and mock data so tests stay fast and in sync with
+# production config structure.
+#
+# The tiny backbone swap (model.model_args.vlm_name_or_path) is applied as
+# a CLI override from the test code so it only hits VLM models that actually
+# have that field.
+
+defaults:
+  - prompt: drive_poutine
+  - model: text_traj_vlm
+  - train_stage: supervised_train
+  - trainer: integration
+  - dataset@data: mock
+  - _self_

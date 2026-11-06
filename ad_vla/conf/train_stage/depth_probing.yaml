@@ -1,0 +1,26 @@
+_target_: ad_vla.train_stages.depth_probing_module.DepthProbingModule
+
+
+optim_cfg:
+  # Optional per-branch learning rates. Null preserves the original optimizer setup.
+  parameter_group_lrs: null
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-4
+
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: null
+
+  lr_interval: step
+
+val_log_every_n_steps: 5
+
+lora_cfg: null
+
+loss_cfg:
+  # DepthProbingModule owns VGGT/DPT setup directly.
+  depth_probing: true
+  target_layer: 22
+  patch_size: 28

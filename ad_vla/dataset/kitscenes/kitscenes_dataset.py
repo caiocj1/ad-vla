@@ -91,7 +91,7 @@ class KITScenesDataset(BaseDataset):
                 image, cal_dict
             )
 
-            image, cal_dict = self._apply_img_transform(image, cal_dict)
+            image, cal_dict = self._apply_img_transform(image, cal_dict, std_cam_name)
 
             # _, w, _ = image.shape
             # left = w // 5

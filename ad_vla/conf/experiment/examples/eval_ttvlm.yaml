@@ -1,0 +1,57 @@
+# @package _global_
+
+# Evaluate an exported TextTrajVLM checkpoint (by default examples/sft_ttvlm_v1_qa's) on the Waymo
+# rater subset, which gives RFS, and on 1,000 PhysicalAI clips. Model settings come from the saved
+# checkpoint; the prompt and image sizes here must match the ones it was trained with.
+#
+#   python scripts/run_evaluation.py +experiment=examples/eval_ttvlm
+#   python scripts/run_evaluation.py +experiment=examples/eval_ttvlm model.ckpt_path=/path/to/hf_ckpt
+
+defaults:
+  - /prompt: drive_poutine
+  - /dataset@data.val.waymo: waymo
+  - /dataset@data.val.physical_ai: physical_ai
+  - override /train_stage: grpo
+  - override /model: text_traj_vlm
+  - _self_
+
+model:
+  ckpt_path: ${data.save_path}/sft_ttvlm_v1_qa/hf_ckpt
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    past_traj_sampling:
+      num_poses: 4
+      interval_length: 0.5
+    pred_traj_sampling:
+      num_poses: 5
+      interval_length: 1.0
+    pad_missing_past_traj: true
+
+prompt:
+  use_cot: false
+
+logging:
+  version: eval_ttvlm
+
+data:
+  primary_val: waymo
+  val:
+    waymo:
+      size: [608, 544]
+      sensors: front_three
+      subset: ${oc.env:ASSETS_DIR}/indices/waymo_pref_idx.pt
+    physical_ai:
+      size: [448, 768]
+      sensors: front_three
+      root: ${oc.env:HF_HOME}
+      clip_ids_path: ${oc.env:PHYSICAL_AI_VAL_CLIP_IDS}
+      stream: false
+      revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+      num_history_steps: 40
+      num_future_steps: 50
+      num_frames: 1
+  val_dataloader_args:
+    batch_size: 2
+
+train_stage:
+  val_log_every_n_steps: 2

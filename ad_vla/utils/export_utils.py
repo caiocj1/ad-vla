@@ -26,10 +26,43 @@ DISTRIBUTED_ENV_KEYS = (
 )
 
 
+EXPORT_MODES = ("last", "last_and_best")
+
+
+def _export_cfg(cfg: DictConfig) -> tuple[str, str]:
+    """Read `export.checkpoints` / `export.best_monitor`; an absent block means "last"."""
+    export_cfg = cfg.get("export") or {}
+    mode = export_cfg.get("checkpoints", "last")
+    if mode not in EXPORT_MODES:
+        raise ValueError(
+            f"export.checkpoints must be one of {EXPORT_MODES}, got {mode!r}."
+        )
+    return mode, export_cfg.get("best_monitor", "eval/ADE")
+
+
+def _best_checkpoint_callback(trainer: Any, monitor: str) -> Any:
+    """The single ModelCheckpoint tracking ``monitor``; raise if there is not exactly one."""
+    matches = [cb for cb in trainer.checkpoint_callbacks if cb.monitor == monitor]
+    if len(matches) != 1:
+        raise ValueError(
+            f"export.checkpoints=last_and_best needs exactly one ModelCheckpoint with "
+            f"monitor={monitor!r} in trainer.callbacks, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def validate_export_cfg(cfg: DictConfig, trainer: Any) -> None:
+    """Fail before training, not after it, if the best checkpoint could not be exported."""
+    mode, monitor = _export_cfg(cfg)
+    if mode == "last_and_best":
+        _best_checkpoint_callback(trainer, monitor)
+
+
 def finalize_training_outputs(cfg: DictConfig, trainer: Any) -> None:
     run_dir = (Path(cfg.data.save_path) / cfg.logging.version).resolve()
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    mode, monitor = _export_cfg(cfg)
 
     final_ckpt_path = (
         checkpoint_dir
@@ -37,25 +70,54 @@ def finalize_training_outputs(cfg: DictConfig, trainer: Any) -> None:
     )
     resolved_config_path = run_dir / "resolved_training_config.yaml"
     status_path = run_dir / "post_training_export_status.txt"
+    # Each export writes its own status file: (checkpoint, output dir, status file).
+    exports = [(final_ckpt_path, run_dir, status_path)]
+
+    if mode == "last_and_best":
+        best_cb = _best_checkpoint_callback(trainer, monitor)
+        if not best_cb.best_model_path:
+            raise RuntimeError(f"No best checkpoint was saved for monitor={monitor!r}.")
+        best_dir = run_dir / "best"
+        exports.append(
+            (
+                Path(best_cb.best_model_path),
+                best_dir,
+                best_dir / "post_training_export_status.txt",
+            )
+        )
 
     print(f"Saving final Lightning checkpoint: {final_ckpt_path}", flush=True)
     trainer.save_checkpoint(str(final_ckpt_path), weights_only=True)
 
     if trainer.is_global_zero:
-        status_path.unlink(missing_ok=True)
         resolved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
         OmegaConf.save(config=resolved_cfg, f=resolved_config_path)
-        _run_export_subprocess(
-            config_path=resolved_config_path,
-            checkpoint_path=final_ckpt_path,
-            output_dir=run_dir,
-            status_path=status_path,
-        )
+        if mode == "last_and_best":
+            best_dir.mkdir(parents=True, exist_ok=True)
+            # Record which checkpoint best/hf_ckpt/ came from; the HF export does not keep it.
+            (best_dir / "best_checkpoint.txt").write_text(
+                f"checkpoint: {best_cb.best_model_path}\n"
+                f"monitor: {monitor}\n"
+                f"score: {float(best_cb.best_model_score)}\n"
+            )
+        for checkpoint_path, output_dir, export_status_path in exports:
+            export_status_path.unlink(missing_ok=True)
+            _run_export_subprocess(
+                config_path=resolved_config_path,
+                checkpoint_path=checkpoint_path,
+                output_dir=output_dir,
+                status_path=export_status_path,
+            )
 
     trainer.strategy.barrier("post_training_export")
 
-    if status_path.exists() and status_path.read_text().startswith("error\n"):
-        raise RuntimeError(status_path.read_text())
+    errors = [
+        path.read_text()
+        for _, _, path in exports
+        if path.exists() and path.read_text().startswith("error\n")
+    ]
+    if errors:
+        raise RuntimeError("\n".join(errors))
 
 
 def _run_export_subprocess(
@@ -112,10 +174,21 @@ def export_from_lightning_checkpoint(
 
     cfg = OmegaConf.load(config_path)
     OmegaConf.set_struct(cfg, False)
-    if "ckpt_path" in cfg.model:
-        cfg.model.ckpt_path = None
-    if "init_mode" in cfg.model:
-        cfg.model.init_mode = "scratch"
+    ckpt_path = cfg.model.get("ckpt_path")
+    if ckpt_path and (Path(ckpt_path) / "config.json").is_file():
+        # Fine-tuned from an exported checkpoint: its saved config is the architecture that
+        # was trained (model_args need not restate it). The Lightning state dict below is
+        # loaded non-strictly: the weights it holds replace the starting ones, and any key it
+        # lacks (printed as "missing") keeps the starting checkpoint's weight, which is right
+        # only for modules that were frozen during training.
+        print(
+            f"Building the model from the starting checkpoint {ckpt_path}.", flush=True
+        )
+    else:
+        if "ckpt_path" in cfg.model:
+            cfg.model.ckpt_path = None
+        if "init_mode" in cfg.model:
+            cfg.model.init_mode = "scratch"
 
     _reset_tmp_dir(tmp_hf_output_dir)
     _reset_tmp_dir(tmp_aux_output_dir)
@@ -220,7 +293,7 @@ def main() -> None:
         "--config", required=True, help="Resolved training config YAML."
     )
     parser.add_argument(
-        "--checkpoint", required=True, help="Final Lightning checkpoint."
+        "--checkpoint", required=True, help="Lightning checkpoint to export."
     )
     parser.add_argument(
         "--output-dir", required=True, help="Training run output directory."

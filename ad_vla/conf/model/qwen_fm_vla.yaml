@@ -1,0 +1,43 @@
+_target_: ad_vla.models.instantiate_model.instantiate_model
+class_path: ad_vla.models.vlas.qwen_fm_vla.QwenFlowMatchingVLA
+init_mode: auto
+ckpt_path: null
+
+model_args:
+  vlm_name_or_path: Qwen/Qwen3.5-2B
+  past_traj_sampling:
+    num_poses: 16
+    interval_length: 0.25
+  pred_traj_sampling:
+    num_poses: 20
+    interval_length: 0.25
+  prompt_cfg: ${prompt}
+  camera_sequence: ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"]
+  num_past_image_frames: 1
+  traj_normalization: 20
+  diff_cfg:
+    num_inference_steps: 10
+    num_repeat_steps: 8
+  action_representation: acc_curv
+  ce_loss_weight: 1.0
+  qa_loss_weight: 1.0
+  diff_loss_weight: 1.0
+
+  # Keys map directly to ActionExpert.__init__.
+  action_expert_cfg:
+    dim: 768
+    depth: 10
+    num_heads: 12
+    ffn_dim: 2048
+    dropout: 0.0
+    attention_dropout: 0.0
+    rope_base: 10000.0
+    qk_norm: true
+    norm_eps: 1.0e-6
+    # Bidirectional self-attention is standard for diffusion/flow matching.
+    causal: false
+    # False disables extrinsic CaPE, visual temporal RoPE, and intrinsics.
+    use_cape: true
+    cape_dim: 32
+    # Extrinsics are in meters, so translations are already O(1).
+    cape_translation_scale: 1.0

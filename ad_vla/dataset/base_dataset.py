@@ -6,8 +6,10 @@ import os
 import torch
 import torch.nn.functional as F
 
+from ad_vla.dataset.agent_boxes import AgentBoxStore
 from ad_vla.dataset.data_types import E2EDataSample
 from ad_vla.dataset.camera_config import SENSOR_CONFIGS
+from ad_vla.utils.img_utils import PerCameraTransform
 
 
 class BaseDataset(Dataset):
@@ -20,6 +22,7 @@ class BaseDataset(Dataset):
         sensors: str = "front_cam_only",
         img_transform: Callable | None = None,
         reasoning_traces_path: str | None = None,
+        agent_boxes_path: str | None = None,
     ):
         """Initialize the common dataset interface.
 
@@ -34,6 +37,8 @@ class BaseDataset(Dataset):
             img_transform: Optional image transform applied to each camera image.
             reasoning_traces_path: Optional directory containing
                 ``*_annotations.jsonl`` files with reasoning traces.
+            agent_boxes_path: Optional directory of an ``AgentBoxStore``, for datasets
+                whose records have no agent labels.
         """
         assert split in ["train", "val", "test"]
         assert sensors in SENSOR_CONFIGS, (
@@ -45,6 +50,8 @@ class BaseDataset(Dataset):
         self.split = split
         self.sensors = sensors
         self.img_transform = img_transform
+        self.agent_boxes_path = agent_boxes_path
+        self._agent_store = None
         if reasoning_traces_path is None:
             self.reasoning_trace_df = None
         else:
@@ -139,19 +146,22 @@ class BaseDataset(Dataset):
         self,
         image: torch.Tensor,
         cal_dict: dict[str, Any],
+        camera: str,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Apply this dataset's image transform and keep calibration coherent."""
-        if self.img_transform is None:
+        """Apply this dataset's image transform for ``camera`` and keep calibration coherent."""
+        transform = self.img_transform
+        if isinstance(transform, PerCameraTransform):
+            transform = transform.for_camera(camera)
+        if transform is None:
             return image, cal_dict
 
-        if not callable(self.img_transform):
+        if not callable(transform):
             raise TypeError(
-                "img_transform must be a callable transform, got "
-                f"{type(self.img_transform).__name__}"
+                f"img_transform must be a callable transform, got {type(transform).__name__}"
             )
 
-        if getattr(self.img_transform, "requires_calibration", False):
-            result = self.img_transform(image, cal_dict)
+        if getattr(transform, "requires_calibration", False):
+            result = transform(image, cal_dict)
             if not isinstance(result, tuple) or len(result) != 2:
                 raise TypeError(
                     "Calibration-aware img_transform must return (image, cal_dict)"
@@ -160,7 +170,7 @@ class BaseDataset(Dataset):
 
         # If doesn't require calibration, assumes img_transform is a simple Resize
         raw_size = tuple(image.shape[:2])
-        transformed = self.img_transform(image.permute(2, 0, 1)).permute(1, 2, 0)
+        transformed = transform(image.permute(2, 0, 1)).permute(1, 2, 0)
         return transformed, self._resize_calibration(
             cal_dict,
             raw_size,
@@ -231,6 +241,24 @@ class BaseDataset(Dataset):
                 f"but this dataset only has {sorted(available_standard_cams)}"
             )
         return config
+
+    def qa_pairs_by_index(self, strict: bool = False) -> dict[int, tuple[Any, ...]]:
+        """Questions of each sample index, which is all that ``dataset.qa_datasets`` needs.
+
+        Args:
+            strict: Raise if an annotation has no sample here, instead of leaving it out.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no QA annotations.")
+
+    def _stored_agent_info(self, scenario_id: str) -> dict[str, Any] | None:
+        """Agent boxes from ``agent_boxes_path``; None without a store, ``boxes=None`` if it lacks this sample."""
+        if self.agent_boxes_path is None:
+            return None
+        if (
+            self._agent_store is None
+        ):  # Opened per worker, so memory maps aren't shared across a fork.
+            self._agent_store = AgentBoxStore(self.agent_boxes_path, self.split)
+        return self._agent_store.agent_info(scenario_id)
 
     def __getitem__(self, idx: int) -> E2EDataSample:
         scenario = self._get_sample(idx)

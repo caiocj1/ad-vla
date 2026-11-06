@@ -1,0 +1,9 @@
+train_dataloader_args:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+
+val_dataloader_args:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false

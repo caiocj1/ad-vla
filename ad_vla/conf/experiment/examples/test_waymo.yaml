@@ -1,0 +1,38 @@
+# @package _global_
+
+# Predict the Waymo E2E test split with an exported TextTrajVLM checkpoint and write a submission
+# under wod_subs/. Its metadata (authors, method name, ...) comes from the WOD_SUB_* variables.
+#
+#   python scripts/run_testing.py +experiment=examples/test_waymo model.ckpt_path=/path/to/hf_ckpt
+
+defaults:
+  - /prompt: drive_poutine
+  - /dataset@data.test.waymo: waymo
+  - override /model: text_traj_vlm
+  - _self_
+
+model:
+  ckpt_path: ${data.save_path}/sft_ttvlm_v1_qa/hf_ckpt
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    past_traj_sampling:
+      num_poses: 4
+      interval_length: 0.5
+    pred_traj_sampling:
+      num_poses: 5
+      interval_length: 1.0
+    pad_missing_past_traj: true
+
+prompt:
+  use_cot: false
+
+logging:
+  version: test_waymo
+
+data:
+  test:
+    waymo:
+      size: [608, 544]
+      sensors: front_three
+  test_dataloader_args:
+    batch_size: 4

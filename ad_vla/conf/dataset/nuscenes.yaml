@@ -1,0 +1,14 @@
+_target_: ad_vla.dataset.nuscenes.nuscenes_dataset.NuScenesDataset
+root: ${oc.env:NUSCENES_ROOT, ???}
+
+
+sensors: "all_cams"
+
+num_past_steps: 8
+num_future_steps: 10
+require_full_past: true
+require_full_future: true
+max_samples: null
+version: null
+qa_annotations_path: null
+verbose: false

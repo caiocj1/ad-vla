@@ -5,13 +5,68 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import scipy.spatial.transform as spt
 import torch
 
+from ad_vla.dataset.agent_boxes import coarse_type, wrap_angle
 from ad_vla.dataset.base_dataset import BaseDataset
 from ad_vla.dataset.data_types import E2EDataSample, TrajectorySampling
 from ad_vla.dataset.physical_ai.physical_ai_types import PHYSAI_CAM_LABELS
+from ad_vla.dataset.intent_labels import load_intent_table
+from ad_vla.utils.intent_utils import intent7_from_path, intent_from_path
+
+
+def ftheta_to_pinhole_maps(
+    fw_poly: np.ndarray,
+    intrinsics: np.ndarray,
+    height: int,
+    half_fov_deg: float,
+    vertical_half_fov_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Maps for ``cv2.remap`` from a virtual pinhole view to an f-theta lens, and the view's K.
+
+    The virtual camera keeps the real one's position, axes and focal length, so extrinsics stay
+    valid and only K changes. The principal point is centred, as the images models expect: an
+    off-centre one cost WildDet3D both recall and accuracy.
+    """
+    focal, cx, cy = intrinsics[0, 0], intrinsics[0, 2], intrinsics[1, 2]
+    # Pixel radius -> angle off the axis, by inverting the lens polynomial numerically.
+    theta_grid = np.radians(np.arange(0.0, 90.0, 0.1))
+    radius_grid = np.polynomial.polynomial.polyval(theta_grid, fw_poly)
+    # A fixed vertical field gives every sensor kit the same aspect ratio. The principal point sits
+    # at very different heights across kits, so "as much as the lens sees" would not.
+    theta_vertical = min(
+        np.radians(vertical_half_fov_deg),
+        np.interp(cy, radius_grid, theta_grid),
+        np.interp(height - cy, radius_grid, theta_grid),
+    )
+    width_out = int(round(2 * focal * np.tan(np.radians(half_fov_deg))))
+    height_out = int(round(2 * focal * np.tan(theta_vertical)))
+    half_width, half_height = width_out / 2, height_out / 2
+    new_k = np.array(
+        [[focal, 0.0, half_width], [0.0, focal, half_height], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    u, v = np.meshgrid(
+        np.arange(width_out, dtype=np.float64), np.arange(height_out, dtype=np.float64)
+    )
+    x, y = (u - half_width) / focal, (v - half_height) / focal
+    rho = np.hypot(x, y)
+    radius = np.polynomial.polynomial.polyval(np.arctan(rho), fw_poly)
+    scale = np.divide(radius, rho, out=np.full_like(rho, focal), where=rho > 1e-9)
+    return (
+        (cx + x * scale).astype(np.float32),
+        (cy + y * scale).astype(np.float32),
+        new_k,
+    )
+
+
+# Rig (rear axle) to vehicle centre and half sizes, to recognise the ego's own track in the autolabels.
+EGO_CENTER_X_M = 1.4
+EGO_HALF_LENGTH_M = 2.45
+EGO_HALF_WIDTH_M = 1.0
 
 
 class PhysicalAIDataset(BaseDataset):
@@ -44,13 +99,27 @@ class PhysicalAIDataset(BaseDataset):
         num_history_steps: Number of past trajectory steps (default 16 = 1.6 s @ 10 Hz).
         num_future_steps: Number of future trajectory steps (default 64 = 6.4 s @ 10 Hz).
         time_step_s: Time between consecutive trajectory points in seconds (default 0.1 s).
-        num_frames: Number of video frames per camera (default 4).
+        num_frames: Number of video frames per camera (default 4). Frames before the clip's start
+            are left out, so the list can be shorter.
+        frame_spacing_s: Time between those frames; ``None`` uses ``time_step_s``.
         stream: If ``True`` (default), stream from HuggingFace; otherwise use
             cached data from *root* / ``HF_HOME``.
         hf_token: HuggingFace token.  Falls back to ``HF_TOKEN`` env var.
         revision: Optional PhysicalAI HuggingFace snapshot revision.  Pin this
             for offline/local-cache training to avoid remote revision lookup.
         include_future: Whether to include future trajectory in the sample.
+        undistort: Return pinhole images, as the other datasets have, instead of the raw f-theta
+            ones. The view keeps each camera's position, axes and focal length, with a centred
+            principal point, so ``intrinsics`` is a true pinhole matrix and ``fw_poly`` /
+            ``bw_poly`` are gone from ``cal_dict``.
+        undistort_half_fov_deg: Horizontal half field of view of the undistorted view.
+        undistort_vertical_half_fov_deg: Its vertical half field of view. The default is what the
+            ``hyperion_8.1`` lens can show below the axis, so both kits get the same framing and
+            aspect; a lens that can't reach it clamps it.
+        intent_from_future: Derive the high-level intent from the future trajectory
+            (``ad_vla.utils.intent_utils.intent_from_path``) instead of ``UNKNOWN``.
+        intent_labels_path: Table of 7-class intents keyed by ``<clip_id>__<t0_us>``
+            (``ad_vla.dataset.intent_labels``); replaces ``intent_from_future``.
         max_video_readers: Maximum number of decoded video reader handles to
             keep open per dataset worker.  ``None`` keeps all readers.
     """
@@ -71,25 +140,50 @@ class PhysicalAIDataset(BaseDataset):
         num_future_steps: int = 64,
         time_step_s: float = 0.1,
         num_frames: int = 4,
+        frame_spacing_s: float | None = None,
         stream: bool = True,
         hf_token: str | None = None,
         revision: str | None = None,
         include_future: bool = True,
         max_video_readers: int | None = 32,
+        intent_from_future: bool = False,
+        intent_labels_path: str | None = None,
+        agent_labels_dir: str | None = None,
+        agent_future_steps: int = 10,
+        agent_future_interval_s: float = 0.5,
+        undistort: bool = False,
+        undistort_half_fov_deg: float = 35.0,
+        undistort_vertical_half_fov_deg: float = 19.5,
         **kwargs: Any,
     ) -> None:
         super().__init__(root, split, sensors, img_transform, reasoning_traces_path)
 
+        self.undistort = undistort
+        self.undistort_half_fov_deg = undistort_half_fov_deg
+        self.undistort_vertical_half_fov_deg = undistort_vertical_half_fov_deg
+        self._undistort_maps: dict[tuple, tuple] = {}
+        self.agent_labels_dir = agent_labels_dir
+        self.agent_future_steps = agent_future_steps
+        self.agent_future_interval_s = agent_future_interval_s
         self.t0_us = t0_us
         self.sample_t0_us = self._resolve_sample_t0_us(t0_us, sample_t0_us)
         self.num_history_steps = num_history_steps
         self.num_future_steps = num_future_steps
         self.time_step_s = time_step_s
         self.num_frames = num_frames
+        self.frame_spacing_s = (
+            time_step_s if frame_spacing_s is None else frame_spacing_s
+        )
         self.stream = stream
         self.revision = revision
         self.include_future = include_future
         self.max_video_readers = max_video_readers
+        # PhysicalAI has no route/intent labels; optionally derive them from the future
+        # trajectory with the rule shared with deployment (ad_vla/utils/intent_utils.py).
+        self.intent_from_future = intent_from_future
+        # Table of 7-class intents keyed by "<clip_id>__<t0_us>" (ad_vla.dataset.intent_labels);
+        # it replaces intent_from_future.
+        self.intent_table = load_intent_table(intent_labels_path)
 
         # Resolve HF token: explicit arg > HF_TOKEN env var
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
@@ -127,6 +221,12 @@ class PhysicalAIDataset(BaseDataset):
         self.sample_index: list[tuple[str, int]] = [
             (clip_id, t0_us) for clip_id in self.clip_ids for t0_us in self.sample_t0_us
         ]
+        if self.intent_table is not None:
+            print(
+                self.intent_table.report(
+                    f"PhysicalAI {split}", (f"{c}__{t}" for c, t in self.sample_index)
+                )
+            )
 
         # Sampling frequency in Hz (10 Hz by default)
         self.sampling_freq = round(1.0 / self.time_step_s)
@@ -249,10 +349,15 @@ class PhysicalAIDataset(BaseDataset):
         ego_data = self._load_egomotion(clip_id, t0_us)
         frames_per_cam, frame_timestamps = self._load_frames(clip_id, t0_us)
         calibrations = self._load_all_calibrations(clip_id)
+        if self.undistort:
+            frames_per_cam, calibrations = self._undistort_views(
+                frames_per_cam, calibrations
+            )
 
         return {
             "clip_id": clip_id,
             "t0_us": t0_us,
+            "agent_info": self._load_agent_info(clip_id, t0_us),
             "ego": ego_data,
             "frames_per_cam": frames_per_cam,
             "frame_timestamps": frame_timestamps,
@@ -270,7 +375,10 @@ class PhysicalAIDataset(BaseDataset):
             "past_traj": ego["history_xyz"][:, :2],  # [T, 2]
         }
 
-        # -- intent ----------------------------------------------------
+        if scenario.get("agent_info") is not None:
+            info["agent_info"] = scenario["agent_info"]
+
+        # -- intent (set below from the future trajectory if enabled) ---
         info["intent"] = "UNKNOWN"
 
         # -- cameras ---------------------------------------------------
@@ -297,7 +405,9 @@ class PhysicalAIDataset(BaseDataset):
                         self._make_teacher_camera_data(image, base_cal_kwargs)
                     )
 
-                image, cal_kwargs = self._apply_img_transform(image, base_cal_kwargs)
+                image, cal_kwargs = self._apply_img_transform(
+                    image, base_cal_kwargs, std_name
+                )
 
                 cameras[t][std_name] = {
                     "image": image,
@@ -313,6 +423,17 @@ class PhysicalAIDataset(BaseDataset):
                 num_poses=info["fut_traj"].shape[0],
                 interval_length=1.0 / self.sampling_freq,
             )
+            if self.intent_from_future:
+                info["intent"] = intent_from_path(info["fut_traj"])
+        if self.intent_table is not None:
+            fut = info.get("fut_traj", np.zeros((0, 2)))
+            first = (
+                np.asarray(fut[0][:2], dtype=np.float64) if len(fut) else np.zeros(2)
+            )
+            speed = float(np.hypot(*first)) * self.sampling_freq
+            info["intent"] = self.intent_table.get(
+                f"{scenario['clip_id']}__{scenario['t0_us']}"
+            ) or intent7_from_path(fut, speed)
 
         # -- metadata --------------------------------------------------
         scenario_id = scenario["clip_id"]
@@ -336,6 +457,169 @@ class PhysicalAIDataset(BaseDataset):
                 info["reasoning_trace"] = None
 
         return E2EDataSample(**info)
+
+    # ------------------------------------------------------------------
+    # Undistortion
+    # ------------------------------------------------------------------
+    def _undistort_views(
+        self, frames_per_cam: dict[str, np.ndarray], calibrations: dict[str, dict]
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
+        """Remap f-theta frames to a pinhole view, with the matching calibration."""
+        out_frames: dict[str, np.ndarray] = {}
+        out_calibrations: dict[str, dict] = {}
+        for cam_name, frames in frames_per_cam.items():
+            calibration = calibrations[cam_name]
+            # Calibrations differ little across the fleet, so a few maps serve many clips.
+            key = (
+                cam_name,
+                frames.shape[1],
+                calibration["fw_poly"].numpy().tobytes(),
+                calibration["intrinsics"].numpy().tobytes(),
+            )
+            if key not in self._undistort_maps:
+                if len(self._undistort_maps) >= 256:
+                    self._undistort_maps.clear()
+                self._undistort_maps[key] = ftheta_to_pinhole_maps(
+                    calibration["fw_poly"].numpy().astype(np.float64),
+                    calibration["intrinsics"].numpy().astype(np.float64),
+                    frames.shape[1],
+                    self.undistort_half_fov_deg,
+                    self.undistort_vertical_half_fov_deg,
+                )
+            map_x, map_y, intrinsics = self._undistort_maps[key]
+            out_frames[cam_name] = np.stack(
+                [
+                    cv2.remap(
+                        frame,
+                        map_x,
+                        map_y,
+                        cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                    )
+                    for frame in frames
+                ]
+            )
+            pinhole = {
+                k: v for k, v in calibration.items() if k not in ("fw_poly", "bw_poly")
+            }
+            pinhole["intrinsics"] = torch.from_numpy(intrinsics.copy())
+            pinhole["original_img_size"] = map_x.shape
+            out_calibrations[cam_name] = pinhole
+        return out_frames, out_calibrations
+
+    # ------------------------------------------------------------------
+    # Agent boxes (obstacle.offline autolabels)
+    # ------------------------------------------------------------------
+    def _load_agent_info(self, clip_id: str, t0_us: int) -> dict[str, Any] | None:
+        """``AgentInfo`` at ``t0_us`` from the clip's autolabels; ``boxes=None`` if the clip has none.
+
+        Rows are in the rig frame at their own time, about 10 Hz per track and not synchronized, so
+        positions are interpolated per track through the world frame. A track counts at a time only
+        if it has rows within one label gap (0.3 s) on either side.
+        """
+        if self.agent_labels_dir is None:
+            return None
+        rows = self._read_agent_labels(clip_id)
+        if rows is None:
+            return {"boxes": None, "source": "autolabel"}
+        times = t0_us + (
+            np.arange(self.agent_future_steps + 1) * self.agent_future_interval_s * 1e6
+        ).astype(np.int64)
+        rows = rows[
+            (rows["t"] >= t0_us - 1_000_000) & (rows["t"] <= times[-1] + 1_000_000)
+        ]
+        egomotion = self._load_egomotion_interpolator(clip_id)
+        pose0 = egomotion(np.array([t0_us], dtype=np.int64)).pose
+        rot0_inv, trans0 = pose0.rotation[0].inv(), pose0.translation[0]
+        ids, names, boxes, fut, mask = [], [], [], [], []
+        max_gap_us = 300_000
+        for track_id, track in rows.groupby("track_id", sort=False):
+            track = track.sort_values("t")
+            t = track["t"].to_numpy(
+                copy=True
+            )  # parquet buffers are read-only, which scipy refuses
+            if not (t[0] <= t0_us <= t[-1]):
+                continue
+            # Rig at the row's time -> world -> rig at t0.
+            poses = egomotion(t).pose
+            local = track[["center_x", "center_y", "center_z"]].to_numpy(
+                dtype=np.float64, copy=True
+            )
+            at_t0 = rot0_inv.apply(
+                poses.rotation.apply(local) + poses.translation - trans0
+            )
+            local_yaw = 2.0 * np.arctan2(
+                track["orientation_z"].to_numpy(), track["orientation_w"].to_numpy()
+            )
+            yaw = np.unwrap(
+                local_yaw + (rot0_inv * poses.rotation).as_euler("ZYX")[:, 0]
+            )
+            size = track[["size_x", "size_y", "size_z"]].to_numpy(dtype=np.float64)
+            state = np.stack(
+                [np.interp(times, t, v) for v in (*at_t0.T, *size.T)]
+                + [wrap_angle(np.interp(times, t, yaw))],
+                axis=-1,
+            ).astype(np.float32)
+            right = np.searchsorted(t, times).clip(1, len(t) - 1)
+            valid = (
+                (times >= t[0])
+                & (times <= t[-1])
+                & (t[right] - t[right - 1] <= max_gap_us)
+            )
+            if not valid[0]:
+                continue
+            # Some clips label the ego vehicle itself: nothing else has its centre inside the ego's footprint.
+            if (
+                abs(state[0, 0] - EGO_CENTER_X_M) < EGO_HALF_LENGTH_M
+                and abs(state[0, 1]) < EGO_HALF_WIDTH_M
+            ):
+                continue
+            ids.append(str(track_id))
+            names.append(str(track["label_class"].iloc[0]))
+            boxes.append(state[0])
+            fut.append(state[1:])
+            mask.append(valid[1:])
+        if not ids:
+            return {"boxes": torch.zeros(0, 7), "track_ids": [], "types": [], "coarse_types": [], "source": "autolabel",
+                    "fut_boxes": torch.zeros(0, self.agent_future_steps, 7), "fut_mask": torch.zeros(0, self.agent_future_steps, dtype=torch.bool),
+                    "fut_interval_s": self.agent_future_interval_s}  # fmt: skip
+        return {
+            "boxes": torch.from_numpy(np.stack(boxes)),
+            "track_ids": ids,
+            "types": names,
+            "coarse_types": [coarse_type(n) for n in names],
+            "source": "autolabel",
+            "fut_boxes": torch.from_numpy(np.stack(fut)),
+            "fut_mask": torch.from_numpy(np.stack(mask)),
+            "fut_interval_s": self.agent_future_interval_s,
+        }
+
+    def _read_agent_labels(self, clip_id: str):
+        """The clip's ``obstacle.offline`` rows, or None if it has no labels. The zip handle is cached."""
+        import io
+        import zipfile
+
+        import pandas as pd
+
+        chunk = self.avdi.get_clip_chunk(clip_id)
+        path = os.path.join(
+            self.agent_labels_dir, f"obstacle.offline.chunk_{chunk:04d}.zip"
+        )
+        if not hasattr(self, "_label_zips"):
+            self._label_zips = {}
+        if chunk not in self._label_zips:
+            if not os.path.exists(path):
+                return None
+            self._label_zips[chunk] = zipfile.ZipFile(path)
+        try:
+            data = self._label_zips[chunk].read(f"{clip_id}.obstacle.offline.parquet")
+        except KeyError:
+            return None
+        rows = pd.read_parquet(io.BytesIO(data))
+        rows["t"] = rows["timestamp_us"].astype(
+            "int64"
+        )  # uint64 wraps around when subtracting
+        return rows
 
     # ------------------------------------------------------------------
     # Egomotion loading (adapted from reference code)
@@ -435,14 +719,15 @@ class PhysicalAIDataset(BaseDataset):
             frames_per_cam: ``{raw_camera_name: np.ndarray (num_frames, H, W, 3)}``
             timestamps_per_cam: ``{raw_camera_name: np.ndarray (num_frames,) int64}``
         """
-        time_step_us = int(self.time_step_s * 1_000_000)
+        spacing_us = int(self.frame_spacing_s * 1_000_000)
         frame_ts = np.array(
             [
-                t0_us - (self.num_frames - 1 - i) * time_step_us
+                t0_us - (self.num_frames - 1 - i) * spacing_us
                 for i in range(self.num_frames)
             ],
             dtype=np.int64,
         )
+        frame_ts = frame_ts[frame_ts >= 0]
 
         frames_per_cam: dict[str, np.ndarray] = {}
         timestamps_per_cam: dict[str, np.ndarray] = {}

@@ -17,6 +17,11 @@ optim_cfg:
 
 val_log_every_n_steps: 5
 
+# Model-specific prediction settings used during validation/evaluation, passed to
+# predict_from_processed_inputs as generate_cfg. null uses the model's defaults.
+# FlowMatchingVLA: {num_eval_samples, eval_aggregation, eval_init, num_inference_steps}.
+val_generate_cfg: null
+
 lora_cfg: null
 
 # Optional nn.Module instantiated by the train stage with `model=...`.

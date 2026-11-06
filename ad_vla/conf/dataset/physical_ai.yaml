@@ -1,7 +1,6 @@
 _target_: ad_vla.dataset.physical_ai.physical_ai_dataset.PhysicalAIDataset
 root: null # Dataset already handles cache dir
 
-img_transform: ${img_transform}
 
 sensors: front_four_tele  # 4 front cameras including real tele
 
@@ -19,3 +18,6 @@ num_history_steps: 16  # 1.6s history @ 10Hz
 num_future_steps: 64   # 6.4s future @ 10Hz
 num_frames: 4          # 4 video frames per camera
 max_video_readers: 32
+# No intent labels in PhysicalAI: true derives GO_LEFT/GO_STRAIGHT/GO_RIGHT from the future
+# trajectory (ad_vla/utils/intent_utils.py, same rule as nuScenes and the AlpaSim driver).
+intent_from_future: false

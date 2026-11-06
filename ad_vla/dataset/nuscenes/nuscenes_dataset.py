@@ -13,7 +13,6 @@ camera-to-ego rotation, and the camera axes are optical/RDF with +x right,
 """
 
 import json
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -23,77 +22,24 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from PIL import Image
 from pyquaternion import Quaternion
-from torch.utils.data import Dataset
 
+from ad_vla.dataset.agent_boxes import coarse_type, wrap_angle
 from ad_vla.dataset.base_dataset import BaseDataset
 from ad_vla.dataset.data_types import (
     E2EDataSample,
     QuestionAnswerPair,
     TrajectorySampling,
 )
-from ad_vla.dataset.nuscenes.nuscenes_types import NUSCENES_CAM_LABELS
+from ad_vla.dataset.nuscenes.nuscenes_types import (
+    _NUSCENES_QA_ANSWER_HINT,
+    _NUSCENES_QA_ANSWERS,
+    NUSCENES_CAM_LABELS,
+)
+from ad_vla.dataset.intent_labels import load_intent_table
+from ad_vla.utils.intent_utils import intent7_from_path, intent_from_path
 
 
 _NUSCENES_AVAILABLE_CAMS = set(NUSCENES_CAM_LABELS.keys())
-
-
-class NuScenesQAPairDataset(Dataset):
-    """Flatten a QA-annotated nuScenes dataset to one item per question.
-
-    The wrapped :class:`NuScenesDataset` still owns scene loading and image
-    transforms. This view only makes question selection deterministic: each
-    item returns one scene sample together with exactly one attached QA pair.
-    Items stay grouped by sample token so the small per-worker cache avoids
-    reloading the same six images for adjacent questions.
-    """
-
-    def __init__(self, scene_dataset: "NuScenesDataset") -> None:
-        if not isinstance(scene_dataset, NuScenesDataset):
-            raise TypeError("scene_dataset must be a NuScenesDataset instance.")
-        if not scene_dataset.qa_by_sample_token:
-            raise ValueError(
-                "NuScenesQAPairDataset requires qa_annotations_path on its "
-                "scene dataset."
-            )
-
-        self.scene_dataset = scene_dataset
-        sample_index_by_token = {
-            sample["token"]: index for index, sample in enumerate(scene_dataset.samples)
-        }
-        missing_tokens = (
-            scene_dataset.qa_by_sample_token.keys() - sample_index_by_token.keys()
-        )
-        if missing_tokens:
-            raise ValueError(
-                f"{len(missing_tokens)} QA-annotated sample tokens are absent "
-                "from the configured nuScenes split/filter."
-            )
-
-        self.items = [
-            (sample_index_by_token[sample_token], qa_pair)
-            for sample_token, qa_pairs in scene_dataset.qa_by_sample_token.items()
-            for qa_pair in qa_pairs
-        ]
-        if not self.items:
-            raise ValueError("The configured NuScenesQA dataset contains no questions.")
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    @lru_cache(maxsize=2)
-    def _load_sample(self, sample_index: int) -> E2EDataSample:
-        return self.scene_dataset[sample_index]
-
-    def __getitem__(self, index: int) -> tuple[E2EDataSample, QuestionAnswerPair]:
-        sample_index, qa_pair = self.items[index]
-        return self._load_sample(sample_index), qa_pair
-
-
-def collate_nuscenes_qa_pairs(
-    batch: list[tuple[E2EDataSample, QuestionAnswerPair]],
-) -> list[tuple[E2EDataSample, QuestionAnswerPair]]:
-    """Keep QA samples as Python objects for model-side prompt construction."""
-    return batch
 
 
 class NuScenesDataset(BaseDataset):
@@ -127,12 +73,20 @@ class NuScenesDataset(BaseDataset):
         require_full_future: bool = True,
         max_samples: int | None = None,
         version: str | None = None,
+        num_past_frames: int = 0,
+        intent_labels_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(root, split, sensors, img_transform, reasoning_traces_path)
+        # Table of 7-class intents keyed by sample token (ad_vla.dataset.intent_labels),
+        # used instead of the 3-class rule on the future; None keeps that rule.
+        self.intent_table = load_intent_table(intent_labels_path)
 
         self.standard_cameras = self._resolve_cameras(_NUSCENES_AVAILABLE_CAMS)
         self.num_past_steps = num_past_steps
+        # Past timesteps in ``sample.cameras``, oldest first, 0.5 s apart. Near the start of a
+        # scene the list is shorter; frames are never repeated.
+        self.num_past_frames = num_past_frames
         self.num_future_steps = num_future_steps
         self.require_full_past = require_full_past
         self.require_full_future = require_full_future
@@ -171,9 +125,34 @@ class NuScenesDataset(BaseDataset):
                 self.samples.append(sample)
                 if max_samples is not None and len(self.samples) >= max_samples:
                     return
+        if self.intent_table is not None:
+            print(
+                self.intent_table.report(
+                    f"nuScenes {split}", (s["token"] for s in self.samples)
+                )
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def qa_pairs_by_index(
+        self, strict: bool = False
+    ) -> dict[int, tuple[QuestionAnswerPair, ...]]:
+        """Questions of each sample, in annotation order. See the base class."""
+        index_by_token = {
+            sample["token"]: index for index, sample in enumerate(self.samples)
+        }
+        missing = self.qa_by_sample_token.keys() - index_by_token.keys()
+        if strict and missing:
+            raise ValueError(
+                f"{len(missing)} QA-annotated sample tokens are absent "
+                "from the configured nuScenes split/filter."
+            )
+        return {
+            index_by_token[token]: pairs
+            for token, pairs in self.qa_by_sample_token.items()
+            if token in index_by_token
+        }
 
     def _get_sample(self, idx: int) -> dict[str, Any]:
         return self.samples[idx]
@@ -220,6 +199,7 @@ class NuScenesDataset(BaseDataset):
             "teacher_cameras": [{}],
             # In nuScenes, scenario_id and sample token are the same identifier.
             "qa_pairs": self.qa_by_sample_token.get(sample["token"]),
+            "agent_info": self._get_agent_info(sample, current_ego_pose),
         }
 
         if self.split != "test":
@@ -237,18 +217,33 @@ class NuScenesDataset(BaseDataset):
                     interval_length=1.0 / self.sampling_freq,
                 )
             info["intent"] = self._infer_intent(future_traj)
+            if self.intent_table is not None:
+                speed = (
+                    float(np.hypot(*future_traj[0])) * self.sampling_freq
+                    if future_traj.shape[0] > 0
+                    else 0.0
+                )
+                info["intent"] = self.intent_table.get(
+                    sample["token"]
+                ) or intent7_from_path(future_traj, speed)
 
-        for cam_name in self.standard_cameras:
-            raw_image, cal_dict = self._get_camera_tensor_and_calib(sample, cam_name)
-            info["teacher_cameras"][-1][cam_name] = self._make_teacher_camera_data(
-                raw_image,
-                cal_dict,
-            )
-            image, cal_dict = self._apply_img_transform(raw_image, cal_dict)
-            info["cameras"][-1][cam_name] = {
-                "image": image,
-                "cal_dict": cal_dict,
-            }
+        frames = [sample]
+        for _ in range(self.num_past_frames):
+            if not frames[0]["prev"]:
+                break
+            frames.insert(0, self.nusc.get("sample", frames[0]["prev"]))
+        info["cameras"] = [{} for _ in frames]
+        for frame, cameras in zip(frames, info["cameras"]):
+            for cam_name in self.standard_cameras:
+                raw_image, cal_dict = self._get_camera_tensor_and_calib(frame, cam_name)
+                if frame is sample:
+                    info["teacher_cameras"][-1][cam_name] = (
+                        self._make_teacher_camera_data(raw_image, cal_dict)
+                    )
+                image, cal_dict = self._apply_img_transform(
+                    raw_image, cal_dict, cam_name
+                )
+                cameras[cam_name] = {"image": image, "cal_dict": cal_dict}
 
         if self.reasoning_trace_df is not None:
             try:
@@ -311,6 +306,8 @@ class NuScenesDataset(BaseDataset):
                         else None
                     ),
                     template_type=annotation.get("template_type"),
+                    allowed_answers=_NUSCENES_QA_ANSWERS,
+                    answer_hint=_NUSCENES_QA_ANSWER_HINT,
                 )
             except KeyError as error:
                 raise ValueError(
@@ -336,6 +333,72 @@ class NuScenesDataset(BaseDataset):
             "log_location": log.get("location"),
             "timestamp": sample["timestamp"],
             "sampling_freq": self.sampling_freq,
+        }
+
+    def _annotation_to_box(
+        self,
+        annotation: dict[str, Any],
+        ego_from_global: np.ndarray,
+        ego_translation: np.ndarray,
+        ego_yaw: float,
+    ) -> list[float]:
+        """Box [7] in the current ego frame. nuScenes sizes are width, length, height."""
+        center = ego_from_global @ (
+            np.asarray(annotation["translation"]) - ego_translation
+        )
+        width, length, height = annotation["size"]
+        yaw = Quaternion(annotation["rotation"]).yaw_pitch_roll[0] - ego_yaw
+        return [*center, length, width, height, float(wrap_angle(yaw))]
+
+    def _get_agent_info(
+        self, sample: dict[str, Any], current_ego_pose: dict[str, Any]
+    ) -> dict[str, Any]:
+        """``AgentInfo`` with ground-truth boxes and tracks; ``boxes=None`` on the unannotated test split."""
+        if self.split == "test":
+            return {"boxes": None, "source": "gt"}
+        rotation = Quaternion(current_ego_pose["rotation"])
+        ego_from_global = rotation.inverse.rotation_matrix
+        ego_translation = np.asarray(current_ego_pose["translation"], dtype=np.float64)
+        ego_yaw = rotation.yaw_pitch_roll[0]
+        interval = 1.0 / self.sampling_freq
+        annotations = [
+            self.nusc.get("sample_annotation", token) for token in sample["anns"]
+        ]
+        boxes = np.zeros((len(annotations), 7), dtype=np.float32)
+        fut_boxes = np.zeros(
+            (len(annotations), self.num_future_steps, 7), dtype=np.float32
+        )
+        fut_mask = np.zeros((len(annotations), self.num_future_steps), dtype=bool)
+        for a, annotation in enumerate(annotations):
+            boxes[a] = self._annotation_to_box(
+                annotation, ego_from_global, ego_translation, ego_yaw
+            )
+            cur = annotation
+            for t in range(self.num_future_steps):
+                if not cur["next"]:
+                    break
+                cur = self.nusc.get("sample_annotation", cur["next"])
+                fut_boxes[a, t] = self._annotation_to_box(
+                    cur, ego_from_global, ego_translation, ego_yaw
+                )
+                fut_mask[a, t] = True
+        names = [annotation["category_name"] for annotation in annotations]
+        return {
+            "boxes": torch.from_numpy(boxes),
+            "types": names,
+            "coarse_types": [coarse_type(name) for name in names],
+            "track_ids": [annotation["instance_token"] for annotation in annotations],
+            "num_points": torch.tensor(
+                [
+                    annotation["num_lidar_pts"] + annotation["num_radar_pts"]
+                    for annotation in annotations
+                ],
+                dtype=torch.int32,
+            ),
+            "source": "gt",
+            "fut_boxes": torch.from_numpy(fut_boxes),
+            "fut_mask": torch.from_numpy(fut_mask),
+            "fut_interval_s": interval,
         }
 
     def _get_sample_ego_pose(self, sample: dict[str, Any]) -> dict[str, Any]:
@@ -374,14 +437,8 @@ class NuScenesDataset(BaseDataset):
 
     @staticmethod
     def _infer_intent(future_traj: np.ndarray) -> str:
-        if future_traj.shape[0] == 0:
-            return "UNKNOWN"
-        final_x, final_y = future_traj[-1]
-        if abs(float(final_y)) > 2.0 and abs(float(final_y)) > 0.25 * abs(
-            float(final_x)
-        ):
-            return "GO_LEFT" if final_y > 0 else "GO_RIGHT"
-        return "GO_STRAIGHT"
+        # Shared with other datasets and with deployment (ad_vla/utils/intent_utils.py).
+        return intent_from_path(future_traj)
 
     def _get_camera_tensor_and_calib(
         self,

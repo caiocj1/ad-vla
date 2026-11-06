@@ -1,0 +1,17 @@
+# Lint on every push and pull request. The tests need the CUDA environment (and a GPU for the
+# integration tests), so they run on a GPU machine: see docs/install.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          version: "0.15.7"
+          args: "check ."

@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
+
+from ad_vla.dataset.builder import build_single_dataset, reject_old_keys
 from pytorch_lightning.loggers import CometLogger, TensorBoardLogger
 from pytorch_lightning import seed_everything
 
@@ -30,6 +32,12 @@ seed_everything(0)
 )
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
+    reject_old_keys(cfg.data)
+    if "dataloader_args" in cfg.data:
+        # An old key would otherwise be ignored silently (default batch size / workers).
+        raise ValueError(
+            "data.dataloader_args was renamed: use data.test_dataloader_args (see ad_vla/conf/README.md)."
+        )
 
     # LOGGER SETUP
     if not cfg.logging.disable_comet:
@@ -50,14 +58,14 @@ def main(cfg: DictConfig):
     print(f"Total parameters: {total_params:,}")
 
     # PREPARE DATA
-    test_dataset = instantiate(cfg.data.val_dataset)
+    test_dataset = build_single_dataset(cfg.data.test, "test", "data.test")
 
     collator = model.get_collator(inference_mode=True)
     test_dataloader = DataLoader(
         test_dataset,
         shuffle=False,
         collate_fn=collator,
-        **cfg.data.dataloader_args,
+        **cfg.data.test_dataloader_args,
     )
 
     # TRAINER SETUP, FIT AND VALIDATE

@@ -1,0 +1,49 @@
+# v1_qa: the main data mix used at first for the AlpaSim challenge, with QA. It trained the TTVLM
+# backbones: driving on PhysicalAI, Waymo, NavSim and nuScenes, plus 3x nuScenes QA.
+# Driving uses the front three cameras; QA needs all six, the default of dataset/nuscenes.yaml.
+defaults:
+  - /dataset@waymo: waymo
+  - /dataset@navsim: navsim
+  - /dataset@nuscenes: nuscenes
+  - /dataset@nuscenes_qa: nuscenes
+  - /dataset@physical_ai: physical_ai
+  - _self_
+
+waymo:
+  size: [608, 544]
+  sensors: front_three
+
+navsim:
+  size: [448, 768]
+  sensors: front_three
+  frame_interval: 2
+  num_history_frames: 4
+
+nuscenes:
+  size: [448, 768]
+  sensors: front_three
+  num_past_steps: 3
+  require_full_past: false
+
+nuscenes_qa:
+  task: qa
+  questions_per_frame: 3
+  size: [384, 672]
+  qa_annotations_path: ${oc.env:ASSETS_DIR}/annotations/nuscenes/NuScenes_train_questions.json
+  require_full_past: false
+  require_full_future: false
+
+physical_ai:
+  size: [448, 768]
+  sensors: front_three
+  root: ${oc.env:HF_HOME}
+  clip_ids_path: ${oc.env:PHYSICAL_AI_TRAIN_CLIP_IDS}
+  stream: false
+  revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+  sample_t0_us: [4100000, 4200000, 4300000, 4400000, 4500000, 4600000, 4700000,
+                 4800000, 4900000, 5000000, 5100000, 5200000, 5300000, 5400000,
+                 5500000, 5600000, 5700000, 5800000, 5900000, 6000000, 6100000]
+  num_history_steps: 40
+  num_future_steps: 50
+  num_frames: 1
+  intent_from_future: true

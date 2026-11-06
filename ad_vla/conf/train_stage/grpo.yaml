@@ -1,0 +1,45 @@
+_target_: ad_vla.train_stages.grpo_module.GRPOModule
+
+
+optim_cfg:
+  # Optional per-branch learning rates. Null preserves the original optimizer setup.
+  parameter_group_lrs: null
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-6
+  
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: null
+
+  lr_interval: step
+
+lora_cfg: null
+
+num_traj_samples_per_gpu: 2 # per gpu -> group size = num_gpus * num_traj_samples
+
+generate_cfg:
+  do_sample: true
+  temperature: 0.9
+  top_p: 0.98
+
+rl_cfg:
+  normalize_by_std: true
+  kl_beta: 0.04
+  reward_scale: 1.0
+  window_size: 100
+  # PPO clip range of the per-step ratio exp(logp - logp_old) (null: no clip). GRPOModule takes one optimizer
+  # step per rollout batch and logp_old is computed with the same weights just before, so the ratio is ~1 and
+  # the clip practically never acts (train/clip_frac ~0): the update is the group-baseline policy gradient + KL.
+  # It would only matter with several updates per rollout batch (not implemented).
+  clip_range: null
+  # Clamp normalized advantages to +-adv_clip_max (null: no clamp).
+  adv_clip_max: null
+  # Floor on the group reward std when normalizing advantages (null: std + 1e-6). Only FlowGRPO-Mix-v10's tiered
+  # reward used it (v10 not pursued); kept for that config.
+  adv_std_floor: null
+  # Models scored per denoising step (FM-VLA sampler=sde): fraction of steps with a loss term.
+  step_fraction: 1.0
+  reward_fn:
+    _target_: ad_vla.rewards.norm_l2_reward.NormL2Reward

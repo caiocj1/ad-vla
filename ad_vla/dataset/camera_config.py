@@ -20,6 +20,25 @@ StandardCamera = Literal[
     "REAR_RIGHT",
 ]
 
+# Order of the labeled images in a question-answering prompt.
+_QA_CAMERA_ORDER: tuple[StandardCamera, ...] = (
+    "FRONT_LEFT",
+    "FRONT",
+    "FRONT_RIGHT",
+    "FRONT_TELE",
+    "SIDE_LEFT",
+    "SIDE_RIGHT",
+    "REAR_LEFT",
+    "REAR",
+    "REAR_RIGHT",
+)
+
+
+def qa_cameras(frame) -> list[str]:
+    """The cameras of one frame that a question-answering prompt shows: all of them."""
+    return [name for name in _QA_CAMERA_ORDER if name in frame]
+
+
 # Sensor configurations: config name -> tuple of standard camera names.
 # "all_cams" is a special sentinel (empty tuple) meaning "load every camera
 # the dataset has".

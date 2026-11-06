@@ -1,0 +1,142 @@
+# @package _global_
+
+# FlowMatchingVLA: a 6-layer action expert (hidden size 1024) trained with flow matching on top of a
+# frozen, already trained TextTrajVLM backbone (examples/sft_ttvlm_v1_qa), on the v1 mix
+# (PhysicalAI, Waymo, NavSim, nuScenes; no QA). The expert reads the backbone's prompt KV cache and
+# its own past-trajectory tokens (8 poses at 0.25 s); it outputs 20 poses at 0.25 s (5 s), averaged
+# over 16 samples at evaluation. The prompt keeps the backbone's input: 4 past poses at 0.5 s.
+#
+#   python scripts/run_training.py +experiment=examples/sft_fm_vla
+#
+# Set model.model_args.backbone_ckpt if the backbone was exported elsewhere. action_stats are the
+# training-set mean and std of the targets, from scripts/utils/compute_action_stats.py.
+
+defaults:
+  - /prompt: drive_poutine
+  - /dataset_mix@data.train: v1
+  - /dataset@data.val.waymo: waymo
+  - /dataset@data.val.physical_ai: physical_ai
+  - override /model: fm_vla
+  - _self_
+
+model:
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    backbone_ckpt: ${data.save_path}/sft_ttvlm_v1_qa/hf_ckpt
+    action_representation: trajs
+    past_traj_sampling:
+      num_poses: 8
+      interval_length: 0.25
+    prompt_past_traj_sampling:
+      num_poses: 4
+      interval_length: 0.5
+    pad_missing_past_traj: true
+    pred_traj_sampling:
+      num_poses: 20
+      interval_length: 0.25
+    diff_cfg:
+      num_repeat_steps: 2
+      num_eval_samples: 16
+      eval_aggregation: mean
+    expert_cfg:
+      hidden_size: 1024
+      intermediate_size: 4096
+      num_layers: 6
+      insulate_backbone: true
+      past_traj_tokens: true
+      past_traj_features: [xy, vel]
+      past_traj_mode: per_pose
+      past_traj_missing_token: true
+    action_stats:
+      action_representation: trajs
+      pred_traj_sampling: {num_poses: 20, interval_length: 0.25}
+      num_samples: 20000
+      mean:
+      - [1.47237, -0.00159]
+      - [2.94406, -0.00208]
+      - [4.4152, -0.00269]
+      - [5.88512, -0.00326]
+      - [7.3533, -0.00369]
+      - [8.81909, -0.00413]
+      - [10.28208, -0.00465]
+      - [11.74176, -0.00529]
+      - [13.19774, -0.00604]
+      - [14.64977, -0.00704]
+      - [16.09778, -0.00841]
+      - [17.54161, -0.01022]
+      - [18.98106, -0.01257]
+      - [20.41591, -0.01549]
+      - [21.84596, -0.01898]
+      - [23.27125, -0.02312]
+      - [24.69187, -0.02798]
+      - [26.10781, -0.03354]
+      - [27.51914, -0.03979]
+      - [28.92644, -0.04678]
+      std:
+      - [1.47324, 0.03555]
+      - [2.94266, 0.09412]
+      - [4.41217, 0.18314]
+      - [5.8802, 0.29977]
+      - [7.34633, 0.44553]
+      - [8.81038, 0.61949]
+      - [10.27213, 0.82003]
+      - [11.73146, 1.04602]
+      - [13.18837, 1.29654]
+      - [14.64273, 1.57048]
+      - [16.09424, 1.86668]
+      - [17.54274, 2.18421]
+      - [18.98811, 2.52211]
+      - [20.43009, 2.87957]
+      - [21.86824, 3.25589]
+      - [23.30249, 3.65021]
+      - [24.73287, 4.06182]
+      - [26.15934, 4.4904]
+      - [27.58193, 4.93564]
+      - [29.00137, 5.39629]
+
+prompt:
+  past_num_poses: 4
+  past_interval: 0.5
+  pred_num_poses: 5
+  pred_interval: 1.0
+  use_cot: false
+
+train_stage:
+  optim_cfg:
+    optimizer:
+      lr: 1.0e-4
+
+logging:
+  version: sft_fm_vla
+
+data:
+  train:
+    nuscenes: {num_past_steps: 8}  # 4 s at 2 Hz for the expert's past tokens
+  drop_cfg:
+    past_traj: 0.2         # the prompt's past
+    expert_past_traj: 0.2  # the expert's past tokens, dropped independently
+  past_traj_truncation_prob: 0.25
+  primary_val: waymo
+  val:
+    waymo:
+      size: [608, 544]
+      sensors: front_three
+      subset: ${oc.env:ASSETS_DIR}/indices/waymo_pref_idx.pt
+    physical_ai:
+      size: [448, 768]
+      sensors: front_three
+      root: ${oc.env:HF_HOME}
+      clip_ids_path: ${oc.env:PHYSICAL_AI_VAL_CLIP_IDS}
+      stream: false
+      revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+      num_history_steps: 40
+      num_future_steps: 50
+      num_frames: 1
+  val_dataloader_args:
+    num_workers: 4
+
+trainer:
+  max_epochs: 5
+
+export:
+  checkpoints: last

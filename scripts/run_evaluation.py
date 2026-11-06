@@ -16,12 +16,22 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────────────────────────
 
 import torch
-from torch.utils.data import Subset, DataLoader
+
+# TF32 tensor cores for FP32 matmuls (the flow-matching expert is kept in FP32; bf16 backbones
+# are unaffected). Inputs are rounded to a 10-bit mantissa, accumulation stays FP32.
+torch.set_float32_matmul_precision("high")
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
 from pytorch_lightning.loggers import CometLogger, TensorBoardLogger
 from pytorch_lightning import seed_everything
+
+from ad_vla.dataset.builder import (
+    QA,
+    build_val_sets,
+    primary_val_name,
+    reject_old_keys,
+)
 
 seed_everything(0)
 
@@ -31,6 +41,12 @@ seed_everything(0)
 )
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
+    if "dataloader_args" in cfg.data:
+        # An old key would otherwise be ignored silently (default batch size / workers).
+        raise ValueError(
+            "data.dataloader_args was renamed: use data.val_dataloader_args (see ad_vla/conf/README.md)."
+        )
+    reject_old_keys(cfg.data)
 
     # LOGGER SETUP
     if not cfg.logging.disable_comet:
@@ -47,31 +63,11 @@ def main(cfg: DictConfig):
 
     # LOAD MODEL
     model = instantiate(cfg.model)
-    if hasattr(model, "calibration_mlp"):
-        model.calibration_mlp.float()
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
 
     # PREPARE DATA
-    val_dataset = instantiate(
-        cfg.data.val_dataset, reasoning_traces_path=cfg.data.reasoning_traces_path
-    )
-    if cfg.data.val_subset_path is not None:
-        subset_idxs = torch.load(cfg.data.val_subset_path)
-        val_dataset = Subset(val_dataset, subset_idxs)
-
-        if cfg.data.train_val_split is not None:
-            train_size = int(len(subset_idxs) * cfg.data.train_val_split)
-            val_subset_idxs = torch.arange(train_size, len(subset_idxs))
-            val_dataset = Subset(val_dataset, val_subset_idxs)
-
-    collator = model.get_collator(inference_mode=True)
-    val_dataloader = DataLoader(
-        val_dataset,
-        shuffle=False,
-        collate_fn=collator,
-        **cfg.data.dataloader_args,
-    )
+    val_sets = build_val_sets(cfg.data, model)
 
     # TRAINER SETUP, FIT AND VALIDATE
     train_stage_module = instantiate(
@@ -81,8 +77,14 @@ def main(cfg: DictConfig):
         _recursive_=False,
     )
 
+    train_stage_module.configure_val_sets(
+        [val_set.name for val_set in val_sets],
+        primary_val_name(cfg.data),
+        qa_names=[val_set.name for val_set in val_sets if val_set.task == QA],
+    )
+
     trainer = instantiate(cfg.trainer, logger=logger)
-    trainer.validate(train_stage_module, val_dataloader)
+    trainer.validate(train_stage_module, [val_set.dataloader() for val_set in val_sets])
 
 
 if __name__ == "__main__":

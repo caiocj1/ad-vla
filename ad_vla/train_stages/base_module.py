@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 from collections.abc import Mapping
 from torchmetrics import MetricCollection, SumMetric
@@ -19,14 +20,67 @@ from ad_vla.metrics.ade import ADE
 from ad_vla.metrics.fde import FDE
 from ad_vla.metrics.rfs import RFS
 from ad_vla.dataset.waymo.waymo_utils import prepare_for_rfs, create_waymo_submission
-from ad_vla.dataset.data_types import E2EDataBatch, TrajectorySampling
+from ad_vla.dataset.data_types import (
+    E2EDataBatch,
+    E2EDataSample,
+    QuestionAnswerPair,
+    TrajectorySampling,
+)
 from ad_vla.utils.plots import plot_pred_in_cam, plot_pref_trajs
 from ad_vla.dataset.waymo.waymo_dataset import WaymoE2EDataset
 from ad_vla.dataset.kitscenes.kitscenes_dataset import KITScenesDataset
+from ad_vla.utils.prompts import normalize_qa_prediction
 from ad_vla.utils.traj_utils import resample_tensor
 
 
+# QA metrics of a run whose validation dataloaders have no names.
+_DEFAULT_QA_SET = "qa"
+
+
+def _is_qa_batch(batch) -> bool:
+    """True for a QA validation batch: the plain ``[(sample, qa_pair), ...]`` list made by
+    ``collate_qa_pairs`` (trajectory batches are ``E2EDataBatch``)."""
+    return (
+        isinstance(batch, list)
+        and len(batch) > 0
+        and all(
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], E2EDataSample)
+            and isinstance(item[1], QuestionAnswerPair)
+            for item in batch
+        )
+    )
+
+
 class BaseTrainingModule(pl.LightningModule):
+    """Shared Lightning logic of the train stages: LoRA / auxiliary-head setup, validation
+    (trajectory metrics ADE / FDE / RFS, optional NuScenesQA accuracy), testing and
+    submission files, and the optimizer / LR scheduler.
+
+    Subclasses implement ``training_step``.
+
+    Args:
+        model: Trajectory planner to train or evaluate.
+        optim_cfg: ``optimizer`` / ``lr_scheduler`` / ``lr_interval``, and optional
+            ``parameter_group_lrs`` (per-branch learning rates, see ``configure_optimizers``).
+        lora_cfg: PEFT ``LoraConfig`` kwargs applied to ``model.vlm``; None trains it as is.
+        loss_cfg: Stage-specific loss settings.
+        aux_head: Optional auxiliary head config, instantiated with ``model=``.
+        aux_loss_weight: Weight of the auxiliary loss.
+        aux_warmup_steps: Linear warm-up of the auxiliary loss weight (None: no warm-up).
+        val_log_every_n_steps: Log validation images every n validation batches.
+        val_target_sampling: Time grid on which validation metrics are computed (ground truth
+            resampled, predictions requested on it). None keeps each dataset's native grid.
+        val_generate_cfg: ``generate_cfg`` passed to ``predict_from_processed_inputs`` in
+            validation (e.g. FlowMatchingVLA's ``num_eval_samples``); None uses the model's
+            own defaults.
+    """
+
+    # Validation dataloader names and the primary one, from ``configure_val_sets``.
+    val_set_names: list[str] = []
+    primary_val_set: str | None = None
+
     def __init__(
         self,
         model: BaseTrajPlanner,
@@ -38,6 +92,7 @@ class BaseTrainingModule(pl.LightningModule):
         aux_warmup_steps: int | None = None,
         val_log_every_n_steps: int = 2,
         val_target_sampling: Mapping | TrajectorySampling | None = None,
+        val_generate_cfg: Mapping | None = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -50,6 +105,9 @@ class BaseTrainingModule(pl.LightningModule):
         self.aux_warmup_steps = aux_warmup_steps
         self.val_log_every_n_steps = val_log_every_n_steps
         self.val_target_sampling = self._coerce_val_target_sampling(val_target_sampling)
+        # Model-specific prediction settings for validation (e.g. FlowMatchingVLA's
+        # num_eval_samples); null uses the model's own defaults.
+        self.val_generate_cfg = val_generate_cfg
 
         if aux_head is not None:
             self.aux_head = instantiate(aux_head, model=self.model)
@@ -60,10 +118,6 @@ class BaseTrainingModule(pl.LightningModule):
             self.model.vlm.print_trainable_parameters()
 
         self.build_metrics()
-        self.qa_val_correct = SumMetric()
-        self.qa_val_valid = SumMetric()
-        self.qa_val_total = SumMetric()
-        self._qa_val_seen = False
 
         self.test_predictions = []
 
@@ -89,6 +143,7 @@ class BaseTrainingModule(pl.LightningModule):
     def _coerce_val_target_sampling(
         sampling: Mapping | TrajectorySampling | None,
     ) -> TrajectorySampling | None:
+        """Accept ``val_target_sampling`` as None, a TrajectorySampling or a Hydra mapping."""
         if sampling is None:
             return None
         if isinstance(sampling, TrajectorySampling):
@@ -104,6 +159,11 @@ class BaseTrainingModule(pl.LightningModule):
         self,
         batch: E2EDataBatch,
     ) -> tuple[torch.Tensor, TrajectorySampling | None]:
+        """Ground-truth future trajectories of a batch and the grid predictions should use.
+
+        Returns the stacked ``fut_traj`` tensors and their sampling, resampled to
+        ``val_target_sampling`` when it is set.
+        """
         source_sampling = batch.samples[0].fut_traj_sampling
         gt_trajs = torch.stack([sample.fut_traj for sample in batch.samples])
 
@@ -124,10 +184,13 @@ class BaseTrainingModule(pl.LightningModule):
         )
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        # QA validation batches deliberately contain a frozen annotation
-        # dataclass. Keep the raw image/sample objects on CPU; the Qwen
-        # processor creates tensors and predict_qa_answers moves those instead.
-        if dataloader_idx == 1:
+        """Move trajectory batches to the device; leave QA batches on the CPU.
+
+        QA validation batches hold raw samples and frozen annotation dataclasses; the
+        processor builds their tensors and ``predict_qa_answers`` moves those instead.
+        Batches are told apart by type, not by dataloader position.
+        """
+        if _is_qa_batch(batch):
             return batch
         return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
@@ -137,13 +200,11 @@ class BaseTrainingModule(pl.LightningModule):
         batch_idx: int,
         dataloader_idx: int = 0,
     ):
-        if dataloader_idx == 1:
-            self._validation_qa_step(batch)
+        """Accumulate trajectory metrics for an ``E2EDataBatch`` or QA accuracy for a QA
+        batch (whichever dataloader it came from)."""
+        if _is_qa_batch(batch):
+            self._validation_qa_step(batch, dataloader_idx)
             return
-        if dataloader_idx != 0:
-            raise ValueError(
-                f"Unexpected validation dataloader index {dataloader_idx}."
-            )
 
         # If training stage uses auxiliary head and it logs on validation,
         # get auxiliary head output and use its own function to properly log.
@@ -176,7 +237,7 @@ class BaseTrainingModule(pl.LightningModule):
             predict_kwargs = {
                 **model_inputs,
                 "num_traj_samples": 1,
-                "generate_cfg": None,  # Use default generation config from model
+                "generate_cfg": self.val_generate_cfg,
                 "target_sampling": gt_traj_sampling,
             }
             if hasattr(self.model, "prepare_image_delta"):
@@ -195,7 +256,22 @@ class BaseTrainingModule(pl.LightningModule):
         if hasattr(batch.samples[0], "pref_trajs"):
             gt_dict.update(prepare_for_rfs(batch, self.device))
 
-        self.val_metrics.update(pred_dict, gt_dict)
+        name = self._val_set_name(dataloader_idx)
+        is_primary = name == self.primary_val_set
+        metrics = self.val_metrics if is_primary else self.other_val_metrics[name]
+        metrics.update(pred_dict, gt_dict)
+        if "single_sample_trajs" in extra:
+            # Models that aggregate several samples also report one raw sample, so the
+            # gain from aggregation is visible.
+            single_sample_ade = (
+                self.val_single_sample_ade
+                if is_primary
+                else self.other_val_single_sample_ade[name]
+            )
+            single_sample_ade.update(
+                {"pred_trajs": extra["single_sample_trajs"]}, gt_dict
+            )
+            self._single_sample_seen.add(name)
 
         if batch_idx % self.val_log_every_n_steps == 0:
             self._log_images(
@@ -204,9 +280,11 @@ class BaseTrainingModule(pl.LightningModule):
 
         return
 
-    def _validation_qa_step(self, qa_batch) -> None:
-        """Accumulate exact NuScenesQA classification counts for one batch."""
-        self._qa_val_seen = True
+    def _validation_qa_step(self, qa_batch, dataloader_idx: int = 0) -> None:
+        """Accumulate one QA set's exact answer counts for one batch."""
+        name = self._val_set_name(dataloader_idx) or _DEFAULT_QA_SET
+        self._qa_val_seen.add(name)
+        metrics = self.qa_val_metrics[name]
         predict_answers = getattr(self.model, "predict_qa_answers", None)
         if predict_answers is None:
             raise TypeError(
@@ -218,8 +296,10 @@ class BaseTrainingModule(pl.LightningModule):
             raise RuntimeError(
                 "QA prediction count does not match the validation batch size."
             )
-        targets = [qa_pair.answer for _, qa_pair in qa_batch]
-        self.qa_val_correct.update(
+        targets = [
+            normalize_qa_prediction(qa_pair.answer, None) for _, qa_pair in qa_batch
+        ]
+        metrics["correct"].update(
             torch.tensor(
                 sum(
                     prediction == target
@@ -229,14 +309,14 @@ class BaseTrainingModule(pl.LightningModule):
                 device=self.device,
             )
         )
-        self.qa_val_valid.update(
+        metrics["valid"].update(
             torch.tensor(
                 sum(prediction is not None for prediction in predictions),
                 dtype=torch.float32,
                 device=self.device,
             )
         )
-        self.qa_val_total.update(
+        metrics["total"].update(
             torch.tensor(len(targets), dtype=torch.float32, device=self.device)
         )
 
@@ -285,6 +365,13 @@ class BaseTrainingModule(pl.LightningModule):
                 raise Exception(f"Testing not implemented for dataset {dataset}.")
 
     def configure_optimizers(self):
+        """Optimizer over the trainable parameters and the LR scheduler.
+
+        With ``optim_cfg.parameter_group_lrs`` set ({vlm: lr, action_branch: lr}, either may be
+        null), parameters of ``model.vlm`` and of the action branch (``action_expert``,
+        ``state_encoder``, ``action_in_proj``, ``action_out_proj``) get their own learning
+        rates; every other trainable parameter keeps the optimizer's default lr.
+        """
         trainable_params = [p for p in self.parameters() if p.requires_grad]
         parameter_group_lrs = self.optim_cfg.get("parameter_group_lrs")
 
@@ -365,33 +452,90 @@ class BaseTrainingModule(pl.LightningModule):
     ##### METRICS, LOGGING, SAVING #####
     ####################################
 
-    def on_validation_epoch_end(self):
-        val_dict = self.val_metrics.compute()
+    def _seen_on_any_rank(self, seen: bool) -> bool:
+        """Whether any rank saw a batch of some kind this epoch.
 
+        Metric ``compute()`` synchronizes across ranks, so every rank must call it or none:
+        deciding per rank would hang DDP when only some ranks received QA batches.
+        """
+        flag = torch.tensor(float(seen), device=self.device)
+        return bool(self.trainer.strategy.reduce(flag, reduce_op="sum") > 0)
+
+    def on_validation_epoch_end(self):
+        primary = self.primary_val_set
+        several = len(self.other_val_metrics) > 0
+
+        val_dict = dict(self.val_metrics.compute())
+        named = {}
+        if several:
+            named |= {
+                f"eval/{primary}/{key.removeprefix('eval/')}": value
+                for key, value in val_dict.items()
+            }
+        for metrics in self.other_val_metrics.values():
+            named |= metrics.compute()
+        # RFS is -1 on datasets without rater trajectories. The plain eval/* names stay as they
+        # were, for comparison with earlier runs.
+        val_dict |= {
+            key: value
+            for key, value in named.items()
+            if not (key.endswith("/RFS") and value < 0)
+        }
         self.log_dict(
             val_dict, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True
         )
-
         self.val_metrics.reset()
+        for metrics in self.other_val_metrics.values():
+            metrics.reset()
 
-        if self._qa_val_seen:
-            qa_total = self.qa_val_total.compute()
-            self.log_dict(
-                {
-                    "eval_qa/accuracy": self.qa_val_correct.compute() / qa_total,
-                    "eval_qa/valid_fraction": self.qa_val_valid.compute() / qa_total,
-                    "eval_qa/questions": qa_total,
-                },
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                # SumMetric synchronizes its state before compute().
-                sync_dist=False,
-            )
-        self.qa_val_correct.reset()
-        self.qa_val_valid.reset()
-        self.qa_val_total.reset()
-        self._qa_val_seen = False
+        single_sample_ades = {primary: self.val_single_sample_ade}
+        single_sample_ades |= dict(self.other_val_single_sample_ade.items())
+        for name, metric in single_sample_ades.items():
+            if self._seen_on_any_rank(name in self._single_sample_seen):
+                value = metric.compute()
+                if name == primary:
+                    self.log(
+                        "eval/ADE_single",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        sync_dist=True,
+                    )
+                if several:
+                    self.log(
+                        f"eval/{name}/ADE_single",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        sync_dist=True,
+                    )
+            metric.reset()
+        self._single_sample_seen = set()
+
+        # Compute QA metrics if present: eval_qa/* for one QA set, eval_qa/<name>/* for several.
+        for name, metrics in self.qa_val_metrics.items():
+            if self._seen_on_any_rank(name in self._qa_val_seen):
+                prefix = (
+                    "eval_qa/" if len(self.qa_val_metrics) == 1 else f"eval_qa/{name}/"
+                )
+                qa_total = metrics["total"].compute()
+                self.log_dict(
+                    {
+                        f"{prefix}accuracy": metrics["correct"].compute() / qa_total,
+                        f"{prefix}valid_fraction": metrics["valid"].compute()
+                        / qa_total,
+                        f"{prefix}questions": qa_total,
+                    },
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    sync_dist=False,
+                )
+            for metric in metrics.values():
+                metric.reset()
+        self._qa_val_seen = set()
 
     def on_test_epoch_end(self) -> None:
         world_size = self.trainer.world_size
@@ -424,14 +568,50 @@ class BaseTrainingModule(pl.LightningModule):
                     f.write(json.dumps(item) + "\n")
 
     def build_metrics(self):
-        self.val_metrics = MetricCollection(
-            {
-                "ADE": ADE(),
-                "FDE": FDE(),
-                "RFS": RFS(),
-            },
-            prefix="eval/",
+        """Create the validation metrics: trajectory ADE / FDE / RFS, single-sample ADE (models
+        that aggregate several samples) and question-answering counts."""
+        self.val_metrics = self._trajectory_metrics("eval/")
+        self.val_single_sample_ade = ADE()
+        self.other_val_metrics = nn.ModuleDict()
+        self.other_val_single_sample_ade = nn.ModuleDict()
+        self._single_sample_seen: set[str | None] = set()
+
+        self.qa_val_metrics = nn.ModuleDict({_DEFAULT_QA_SET: self._qa_metrics()})
+        self._qa_val_seen: set[str] = set()
+
+    @staticmethod
+    def _trajectory_metrics(prefix: str) -> MetricCollection:
+        return MetricCollection(
+            {"ADE": ADE(), "FDE": FDE(), "RFS": RFS()},
+            prefix=prefix,
         )
+
+    @staticmethod
+    def _qa_metrics() -> nn.ModuleDict:
+        return nn.ModuleDict(
+            {"correct": SumMetric(), "valid": SumMetric(), "total": SumMetric()}
+        )
+
+    def configure_val_sets(self, names: list[str], primary: str | None, qa_names=()):
+        """Name the validation dataloaders, in order.
+
+        The primary set logs the plain ``eval/*`` metrics, which pick the best checkpoint. With
+        several trajectory sets, each one also logs ``eval/<name>/*``.
+        """
+        self.val_set_names = list(names)
+        self.primary_val_set = primary
+        others = [n for n in names if n != primary and n not in qa_names]
+        self.other_val_metrics = nn.ModuleDict(
+            {n: self._trajectory_metrics(f"eval/{n}/") for n in others}
+        )
+        self.other_val_single_sample_ade = nn.ModuleDict({n: ADE() for n in others})
+        if qa_names:
+            self.qa_val_metrics = nn.ModuleDict(
+                {n: self._qa_metrics() for n in qa_names}
+            )
+
+    def _val_set_name(self, dataloader_idx: int) -> str | None:
+        return self.val_set_names[dataloader_idx] if self.val_set_names else None
 
     def _log_images(self, batch, pred_at_gt, gt_trajs, reasoning_traces):
         """Log visualization images to comet and/or disk."""

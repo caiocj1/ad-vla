@@ -1,0 +1,63 @@
+_target_: ad_vla.models.instantiate_model.instantiate_model
+class_path: ad_vla.models.vlas.fm_vla.FlowMatchingVLA
+init_mode: auto
+ckpt_path: null
+
+
+model_args:
+  vlm_name_or_path: Qwen/Qwen3.5-2B
+  # Optional trained wrapper checkpoint (e.g. a TextTrajVLM hf_ckpt/) whose `.vlm` is used as the
+  # backbone. Must have been trained on vlm_name_or_path.
+  backbone_ckpt: null
+  backbone_class_path: ad_vla.models.vlas.text_traj_vlm.TextTrajVLM
+  # Extra kwargs for processor.apply_chat_template, e.g. {enable_thinking: false} for Cosmos3-Edge.
+  chat_template_kwargs: {}
+  past_traj_sampling:
+    num_poses: 16
+    interval_length: 0.25
+  pred_traj_sampling:
+    num_poses: 20
+    interval_length: 0.25
+  prompt_cfg: ${prompt}
+  camera_sequence: ["FRONT_LEFT", "FRONT", "FRONT_RIGHT"]
+  num_past_image_frames: 1
+  traj_normalization: 20
+  diff_cfg:
+    num_inference_steps: 10
+    num_repeat_steps: 8
+    # Prediction: each output trajectory aggregates num_eval_samples flow samples in XY.
+    # Overridable at eval time via train_stage.val_generate_cfg (saved checkpoints keep
+    # their own model config).
+    num_eval_samples: 1
+    eval_aggregation: mean  # mean | medoid (sample closest to the mean)
+    eval_init: random       # random: N(0, I) start | zero: deterministic, needs num_eval_samples=1
+    # Inference as CUDA graphs (ad_vla/models/vlas/fm_vla_cuda_graph.py): same outputs,
+    # several times lower latency at small batch sizes. Prompts are right-padded to
+    # cuda_graph_prompt_len (null: first batch's longest + 64).
+    cuda_graph: false
+    cuda_graph_prompt_len: null
+  action_representation: trajs  # trajs | acc_curv | polar (polar needs action_stats)
+  expert_cfg:
+    hidden_size: 1024
+    intermediate_size: 4096
+    num_heads: null   # null: backbone's query heads (must be a multiple of its KV heads)
+    kv_layers: null   # null: backbone full-attention layers (Qwen3.5-2B: 3,7,11,15,19,23), subsampled to num_layers
+    num_layers: 6
+    # Detach backbone KV and freeze the backbone: the diffusion loss never updates the VLM.
+    # LoRA adapters (if lora_cfg is set) then only train through other losses (e.g. aux heads);
+    # with no other VLM loss they stay unused and DDP needs find_unused_parameters.
+    insulate_backbone: true
+    time_embed_dim: 256
+    rms_norm_eps: 1.0e-6
+    # Ego past trajectory (on past_traj_sampling) as state tokens prepended to the action
+    # tokens. Masked to learned null tokens when drop_cfg drops past_traj from the prompt.
+    past_traj_tokens: false
+    past_traj_features: [xy, vel]  # subset of xy | vel (finite-difference velocity)
+    past_traj_mode: per_pose       # per_pose: one token per pose | pooled: one token
+    # Camera geometry for the expert (left unset = off; the saved config of runs without it is
+    # unchanged). camera_geometry: ray_kv adds each image token's ego-frame viewing ray, camera
+    # centre, normalized image coordinates and frame index to the image tokens' prompt keys/values
+    # (zero-initialized, see CameraGeometryKV); needs calibrated cameras (cal_dict, optical axes).
+    # To warm-start from a checkpoint without it: model.config_overrides.expert_cfg.camera_geometry.
+    # camera_geometry: ray_kv
+    # camera_geometry_cfg: {hidden_size: 256, fourier_bands: 4, translation_norm_m: 10.0, require_calibration: true}

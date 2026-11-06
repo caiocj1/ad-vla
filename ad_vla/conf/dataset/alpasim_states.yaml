@@ -1,0 +1,9 @@
+# Closed-loop AlpaSim states for RL (ad_vla/dataset/alpasim/alpasim_state_dataset.py), recorded in
+# AlpaSim rollouts. No ground-truth future; the reward context is in metadata["rl_ctx"].
+_target_: ad_vla.dataset.alpasim.alpasim_state_dataset.AlpaSimStateDataset
+state_dirs: ???          # one directory (or glob) or a list of them
+state_list: null         # or: a file of state paths [+ tab + group] (set state_dirs: null)
+image_size: [448, 768]   # the driver's TTVLM_IMAGE_SIZE
+past_interval_s: 0.25    # the checkpoint's past_traj_sampling.interval_length (driver past grid)
+max_states: null
+centerline_dirs: null    # lane-centreline files of the states

@@ -208,12 +208,64 @@ class AgentInfo(BaseTensorModel):
     Attributes:
         pos: Tensor shaped [N, T, 2] with xy positions of external agents.
         mask: Tensor shaped [N, T] with valid timesteps for each external agent.
-        types: List of strings denoting agent type.
+        types: List of strings denoting agent type (the source's raw names).
+        boxes: Tensor shaped [N, 7]: x, y, z, length, width, height, yaw in the current ego frame
+            (x forward, y left, z up). None means no annotations for this sample; shape [0, 7]
+            means annotated, with no agents. Never read None as an empty road.
+        track_ids: Per-agent track identifier, stable over the clip where tracks exist.
+        coarse_types: Per-agent "vehicle", "person", "cyclist" or "other".
+        scores: Tensor shaped [N], detection confidence; None for ground truth.
+        source: "gt", "autolabel" or "wilddet3d".
+        fut_boxes: Tensor shaped [N, T, 7], the same agents at future steps, in the current ego frame.
+        fut_mask: Tensor shaped [N, T]. False means unknown (track lost or scene ended), not free.
+        fut_interval_s: Seconds between the steps of ``fut_boxes``; step 0 is one interval ahead.
+        num_points: Tensor shaped [N], lidar + radar points on the box where the source has them.
+        visible_bev: Bool tensor [X, Y]: BEV cells in the cameras' view. Elsewhere the absence of a box means nothing.
     """
 
     pos: torch.Tensor | None = None
     mask: torch.Tensor | None = None
     types: list[str] | None = None
+    boxes: torch.Tensor | None = None
+    track_ids: list[str] | None = None
+    coarse_types: list[str] | None = None
+    scores: torch.Tensor | None = None
+    source: str | None = None
+    fut_boxes: torch.Tensor | None = None
+    fut_mask: torch.Tensor | None = None
+    fut_interval_s: float | None = None
+    num_points: torch.Tensor | None = None
+    visible_bev: torch.Tensor | None = None
+
+    @model_validator(mode="after")
+    def check_box_shapes(self):
+        if self.boxes is None:
+            return self
+        if self.boxes.ndim != 2 or self.boxes.shape[1] != 7:
+            raise ValueError(
+                f"Agent boxes must be [N, 7], got {tuple(self.boxes.shape)}"
+            )
+        n = self.boxes.shape[0]
+        for name in ("track_ids", "coarse_types", "scores", "num_points"):
+            v = getattr(self, name)
+            if v is not None and len(v) != n:
+                raise ValueError(f"{name} has {len(v)} entries for {n} boxes")
+        if self.fut_boxes is not None:
+            if self.fut_mask is None or self.fut_interval_s is None:
+                raise ValueError("fut_boxes needs fut_mask and fut_interval_s")
+            if (
+                self.fut_boxes.ndim != 3
+                or self.fut_boxes.shape[0] != n
+                or self.fut_boxes.shape[2] != 7
+            ):
+                raise ValueError(
+                    f"fut_boxes must be [{n}, T, 7], got {tuple(self.fut_boxes.shape)}"
+                )
+            if self.fut_mask.shape != self.fut_boxes.shape[:2]:
+                raise ValueError(
+                    f"fut_mask {tuple(self.fut_mask.shape)} does not match fut_boxes"
+                )
+        return self
 
     @model_validator(mode="after")
     def check_shapes(self):
@@ -265,12 +317,22 @@ class QuestionAnswerPair:
         answer: Exact short text the backbone should produce.
         num_hop: Number of reasoning hops reported by NuScenesQA, when present.
         template_type: NuScenesQA question category, such as ``"status"``.
+        category: Dataset's question category, when present.
+        scope: ``"video"`` for a question about a whole clip, else ``"image"``.
+        options: Lettered choices shown with the question; ``answer`` is then a letter.
+        allowed_answers: The lowercase answers that count as valid, or ``None`` for free text.
+        answer_hint: Text shown with the question about the form of the answer.
     """
 
     question: str
     answer: str
     num_hop: int | None = None
     template_type: str | None = None
+    category: str | None = None
+    scope: str = "image"
+    options: tuple[str, ...] | None = None
+    allowed_answers: frozenset[str] | None = None
+    answer_hint: str | None = None
 
 
 class E2EDataSample(BaseTensorModel):
@@ -279,18 +341,22 @@ class E2EDataSample(BaseTensorModel):
     ``qa_pairs`` belongs to the same scene/sample as the images and trajectory.
     It is annotation data, not metadata: for nuScenes the existing
     ``metadata['scenario_id']`` already identifies the official sample token.
+    ``qa_pair`` is the question this item trains on; without one it trains on driving.
+    A question-answering-only sample (NuPlanQA) has no driving task: its ``agent_input`` is empty
+    and ``intent``, ``fut_traj`` and ``agent_info`` are None.
     """
 
     metadata: dict[str, Any]
     agent_input: dict[str, torch.Tensor]
     cameras: list[dict[str, CameraData]]
     teacher_cameras: list[dict[str, CameraData]] | None = None
-    intent: str
+    intent: str | None
     fut_traj: torch.Tensor | None = None  # [T, 2] ground truth trajectory
     fut_traj_sampling: TrajectorySampling | None = None
     reasoning_trace: str | None = None
     agent_info: AgentInfo | None = None
     qa_pairs: tuple[QuestionAnswerPair, ...] | None = None
+    qa_pair: QuestionAnswerPair | None = None
 
     @field_validator("agent_input")
     @classmethod
@@ -343,6 +409,20 @@ class _SamplesCarrier:
 
 
 class E2EDataBatch(BaseTensorModel, Mapping):
+    """Model tensors plus scene/task metadata for a collated batch.
+
+    ``qa_mask`` is a Boolean tensor shaped ``[batch_size]``, aligned with
+    ``samples``: True denotes QA supervision, False denotes planning. QA-capable
+    collators always provide it, including an all-false planning-only mask.
+    It must stay outside ``model_inputs``. Qwen FM training requires the mask;
+    spatial forcing treats None from other collators as planning-only.
+
+    ``__qa_mask__`` is an internal mapping-reconstruction key used during batch
+    pinning/device transfer, not a second caller-facing storage location.
+    Attached scene questions remain on ``sample.qa_pairs``; they do not by
+    themselves identify the task selected for this training occurrence.
+    """
+
     _SAMPLES_KEY: ClassVar[str] = "__samples__"
     _QA_MASK_KEY: ClassVar[str] = "__qa_mask__"
 

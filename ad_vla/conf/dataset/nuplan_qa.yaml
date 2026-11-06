@@ -1,0 +1,17 @@
+# NuPlanQA: questions on nuPlan frames, six cameras. QA only (no trajectory, intent or agents), so
+# task: qa. Frames are 0.6 s apart, which QA turns state in place of the prompt's 0.5 s.
+# Images: root/part_<archive>/<image token>.jpg, one folder per extracted camera archive; frames of
+# other archives are left out of training, and validation refuses them. For validation use
+# qa_annotations_path: .../nuplanqa_eval_test.json (multiple choice; needs val_camera_0 and
+# train_camera_41, 42).
+_target_: ad_vla.dataset.nuplan_qa.nuplan_qa_dataset.NuPlanQADataset
+root: ${oc.env:NUPLANQA_IMAGES_ROOT}
+index_path: ${oc.env:ASSETS_DIR}/indices/nuplanqa_index.npz
+qa_annotations_path: ${oc.env:ASSETS_DIR}/annotations/nuplan_qa/nuplanqa_train.json
+
+task: qa
+sensors: all_cams
+size: [256, 448]  # 16:9; 112 image tokens a camera, 672 a frame
+num_past_frames: 1  # the current frame and the one 0.6 s earlier
+past_frame_stride: 1
+ego_state_text: true  # the past speed and steering that come with each question

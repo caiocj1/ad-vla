@@ -1,0 +1,100 @@
+# @package _global_
+
+# TextTrajVLM on the v2_qa mix: PhysicalAI, Waymo, NavSim and nuScenes driving plus Waymo QA (each
+# question 5 times per epoch), with 3 image frames 0.5 s apart and 7-class intents from label tables.
+# Past: 4 poses at 0.5 s; output: 5 waypoints at 1 s. Validation: the Waymo rater subset (primary),
+# 1,000 undistorted PhysicalAI clips and 1,000 Waymo multiple-choice questions.
+#
+#   python scripts/run_training.py +experiment=examples/sft_ttvlm_v2_qa
+#
+# Needs, besides the dataset roots, ASSETS_DIR (Waymo clip indices and QA files), INTENT_LABELS_DIR,
+# PHYSICAL_AI_TRAIN_CLIP_IDS and PHYSICAL_AI_VAL_CLIP_IDS.
+
+defaults:
+  - /prompt: drive_vqa
+  - /dataset_mix@data.train: v2_qa
+  - /dataset@data.val.waymo: waymo
+  - /dataset@data.val.physical_ai: physical_ai
+  - /dataset@data.val.waymo_qa: waymo
+  - override /model: text_traj_vlm
+  - _self_
+
+model:
+  model_args:
+    vlm_name_or_path: Qwen/Qwen3.5-2B
+    num_past_image_frames: 3
+    past_traj_sampling:
+      num_poses: 4
+      interval_length: 0.5
+    pred_traj_sampling:
+      num_poses: 5
+      interval_length: 1.0
+    pad_missing_past_traj: true
+    concat_cameras: false
+
+prompt:
+  use_cot: false
+
+train_stage:
+  optim_cfg:
+    optimizer:
+      lr: 1.0e-4
+  lora_cfg:
+    r: 16
+    lora_alpha: 32
+    target_modules: all-linear
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+logging:
+  version: sft_ttvlm_v2_qa
+
+data:
+  drop_cfg:
+    past_traj: 0.2
+    intent: 0.2
+  primary_val: waymo
+  val:
+    waymo:
+      size: [512, 448]
+      sensors: front_three
+      subset: ${oc.env:ASSETS_DIR}/indices/waymo_pref_idx.pt
+      num_past_frames: 2
+      past_frame_stride: 5
+      clip_index_path: ${oc.env:ASSETS_DIR}/indices/wod_e2e_val_clip_to_dataset_indices.pkl
+      intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_waymo_val.json
+    physical_ai:
+      size: [320, 640]
+      sensors: front_three
+      undistort: true
+      root: ${oc.env:HF_HOME}
+      clip_ids_path: ${oc.env:PHYSICAL_AI_VAL_CLIP_IDS}
+      stream: false
+      revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+      t0_us: 5100000
+      num_history_steps: 40
+      num_future_steps: 50
+      num_frames: 3
+      frame_spacing_s: 0.5
+      intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_physical_ai_val.json
+    waymo_qa:
+      task: qa
+      size: [352, 320]
+      camera_sizes: {REAR_LEFT: [192, 320], REAR: [192, 320], REAR_RIGHT: [192, 320]}
+      qa_annotations_path: ${oc.env:ASSETS_DIR}/annotations/waymo/validation_mcq.jsonl
+      clip_index_path: ${oc.env:ASSETS_DIR}/indices/wod_e2e_val_clip_to_dataset_indices.pkl
+      num_past_frames: 2
+      past_frame_stride: 5
+      max_questions: 1000
+      dataloader_args: {batch_size: 4, num_workers: 4, pin_memory: true, persistent_workers: false}
+
+  # Batch 4 runs out of memory with 3 frames on an 80 GB GPU; accumulation keeps 64 samples a step.
+  train_dataloader_args:
+    batch_size: 2
+  val_dataloader_args:
+    num_workers: 4
+
+trainer:
+  accumulate_grad_batches: 8  # with 4 GPUs
+  val_check_interval: 2000

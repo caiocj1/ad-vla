@@ -1,1 +1,0 @@
-"""NAVSIM dataset adapter."""

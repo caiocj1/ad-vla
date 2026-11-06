@@ -19,6 +19,7 @@ class SupervisedTrainModule(BaseTrainingModule):
         aux_warmup_steps: int | None = None,
         val_log_every_n_steps: int = 2,
         val_target_sampling: DictConfig | dict | TrajectorySampling | None = None,
+        val_generate_cfg: DictConfig | dict | None = None,
     ):
         super().__init__(
             model=model,
@@ -30,10 +31,11 @@ class SupervisedTrainModule(BaseTrainingModule):
             aux_warmup_steps=aux_warmup_steps,
             val_log_every_n_steps=val_log_every_n_steps,
             val_target_sampling=val_target_sampling,
+            val_generate_cfg=val_generate_cfg,
         )
 
     def training_step(self, batch: E2EDataBatch, batch_idx: int):
-        qa_mask = batch.model_inputs.get("qa_mask")
+        qa_mask = batch.qa_mask
         if (
             qa_mask is not None
             and self.global_rank == 0
@@ -45,7 +47,8 @@ class SupervisedTrainModule(BaseTrainingModule):
                     "train/qa_rows_rank0_batch": qa_rows,
                     "train/qa_fraction_rank0_batch": qa_rows / qa_mask.numel(),
                 },
-                step=self.trainer.fit_loop.epoch_loop.total_batch_idx,
+                # Same x-axis as the other training metrics (optimizer steps, not batches).
+                step=self.global_step,
             )
 
         # Currently delegates loss calculation to model, and returns it for training
@@ -85,21 +88,3 @@ class SupervisedTrainModule(BaseTrainingModule):
                 sync_dist=False,
             )
         return loss_dict["loss"]
-
-    # def validation_step(self, batch: E2EDataBatch, batch_idx: int):
-    #     if self.aux_head is not None and getattr(
-    #         self.aux_head, "log_on_validation", False
-    #     ):
-    #         self.model(**batch.model_inputs)
-    #         _, extra_aux = self.aux_head.compute_aux_loss(batch)
-    #         if batch_idx % self.val_log_every_n_steps == 0:
-    #             self.aux_head.log_validation_outputs(
-    #                 self.logger,
-    #                 batch,
-    #                 extra_aux,
-    #                 self.global_step,
-    #             )
-
-    #     # Continue with normal validation step if also training backbone
-    #     if not self.train_aux_head_only():
-    #         super().validation_step(batch, batch_idx)

@@ -50,6 +50,11 @@ _NUSCENES_QA_ANSWERS = frozenset(
         "yes",
     }
 )
+_NUSCENES_QA_ANSWER_HINT = (
+    "Allowed answers: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, barrier, bicycle, bus, car, construction "
+    "vehicle, motorcycle, moving, no, not standing, parked, pedestrian, standing, stopped, "
+    "traffic cone, trailer, truck, with rider, without rider, yes."
+)
 _NUSCENES_QA_SYSTEM_PROMPT = """You are a surround-view visual question-answering assistant for an ego vehicle. All six labeled camera images show the same moment. Interpret front, back, left, and right relative to the ego vehicle. Answer the user's question with exactly one lowercase answer from the allowed set below. Output only the answer: do not explain, repeat the question, add punctuation, or add any other text.
 
 Allowed answers: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, barrier, bicycle, bus, car, construction vehicle, motorcycle, moving, no, not standing, parked, pedestrian, standing, stopped, traffic cone, trailer, truck, with rider, without rider, yes."""

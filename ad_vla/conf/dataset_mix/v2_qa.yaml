@@ -1,0 +1,76 @@
+# v2_qa: every dataset gives 3 frames, 0.5 s apart, oldest first, with the past left out where the
+# data has none. Driving on PhysicalAI (undistorted), Waymo, NavSim and nuScenes with the front three
+# cameras; QA on Waymo with all cameras. Needs prompt: drive_vqa and
+# model_args.num_past_image_frames: 3. nuScenes QA is left out until its questions and answers are fixed.
+# Intents: 7 classes (FOLLOW_LANE, TURN_LEFT, TURN_RIGHT, LANE_CHANGE_LEFT, LANE_CHANGE_RIGHT, U_TURN,
+# UNKNOWN) from tables made with the whole logged future (ad_vla/dataset/intent_labels.py); the same
+# rule as ad_vla.utils.intent_utils.intent7_from_path. QA turns don't use the intent.
+defaults:
+  - /dataset@waymo: waymo
+  - /dataset@navsim: navsim
+  - /dataset@nuscenes: nuscenes
+  - /dataset@waymo_qa: waymo
+  - /dataset@physical_ai: physical_ai
+  - _self_
+
+waymo:
+  size: [512, 448]
+  sensors: front_three
+  num_past_frames: 2
+  past_frame_stride: 5
+  clip_index_path: ${oc.env:ASSETS_DIR}/indices/wod_e2e_train_clip_to_dataset_indices.pkl
+  intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_waymo_train.json
+
+# Logs are 2 Hz, so history frames are 0.5 s apart. frame_interval 1 starts a sample at each of them.
+navsim:
+  size: [352, 640]
+  sensors: front_three
+  frame_interval: 1
+  num_history_frames: 4
+  num_image_frames: 3
+  still_keep_every: 10  # a third of the frames are a car standing still: keep one per 5 s of a stop
+  intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_navsim_train.json
+
+# Samples are 2 Hz, so past samples are 0.5 s apart.
+nuscenes:
+  size: [352, 640]
+  sensors: front_three
+  num_past_steps: 3
+  require_full_past: false
+  num_past_frames: 2
+  intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_nuscenes_train.json
+
+# The rear cameras are about half as tall as the others, so they have their own size.
+waymo_qa:
+  task: qa
+  questions_per_frame: null
+  repeat: 5  # 13,704 questions, each seen 5 times per epoch (68,520 items, 6.7% of the mix)
+  size: [352, 320]
+  camera_sizes:
+    REAR_LEFT: [192, 320]
+    REAR: [192, 320]
+    REAR_RIGHT: [192, 320]
+  qa_annotations_path: ${oc.env:ASSETS_DIR}/annotations/waymo/train.jsonl
+  clip_index_path: ${oc.env:ASSETS_DIR}/indices/wod_e2e_train_clip_to_dataset_indices.pkl
+  num_past_frames: 2
+  past_frame_stride: 5
+
+# The undistorted view has aspect 1.98 (half fields of view 35 and 19.5 degrees), hence 320 x 640.
+# t0 every 0.5 s over the whole ~20 s clip: 4 s to 15 s, which leaves 4 s of past and 5 s of future.
+physical_ai:
+  size: [320, 640]
+  sensors: front_three
+  undistort: true
+  root: ${oc.env:HF_HOME}
+  clip_ids_path: ${oc.env:PHYSICAL_AI_TRAIN_CLIP_IDS}
+  stream: false
+  revision: b719eea7f0a63619ef51ec7f54178af0937ef050
+  sample_t0_us: [4000000, 4500000, 5000000, 5500000, 6000000, 6500000, 7000000,
+                 7500000, 8000000, 8500000, 9000000, 9500000, 10000000, 10500000,
+                 11000000, 11500000, 12000000, 12500000, 13000000, 13500000, 14000000,
+                 14500000, 15000000]
+  num_history_steps: 40
+  num_future_steps: 50
+  num_frames: 3
+  frame_spacing_s: 0.5
+  intent_labels_path: ${oc.env:INTENT_LABELS_DIR}/intents_physical_ai_train.json

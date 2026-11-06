@@ -1,18 +1,30 @@
+# Environment and caches
 .env
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.coverage
-htmlcov/
+.mplconfig/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Run outputs
 outputs/
+output/
 lightning_logs/
+*_subs/
 *.ckpt
 hf_ckpt/
 aux_models/
-*.egg-info/
+
+# Local experiment configs: put your own runs here, or name them *_untracked.yaml
+ad_vla/conf/experiment/scratch/
+*untracked.yaml
+
+# Build
 dist/
 build/
-*.sh

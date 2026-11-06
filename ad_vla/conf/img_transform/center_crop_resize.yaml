@@ -1,0 +1,6 @@
+_target_: ad_vla.utils.img_utils.CenterCropResize
+
+
+p_transform: 0.8
+h_crop_ratio: 0.3
+w_crop_ratio: 0.2

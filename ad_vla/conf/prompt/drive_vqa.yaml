@@ -1,0 +1,31 @@
+# One system prompt for driving and question-answering turns. Based on drive_poutine: a QA turn gets
+# this same text, and driving turns still drop the lines of dropped inputs.
+name: drive_vqa
+
+past_num_poses: ${model.model_args.past_traj_sampling.num_poses}
+past_interval: ${model.model_args.past_traj_sampling.interval_length}
+pred_num_poses: ${model.model_args.pred_traj_sampling.num_poses}
+pred_interval: ${model.model_args.pred_traj_sampling.interval_length}
+num_image_frames: ${model.model_args.num_past_image_frames}
+image_interval: 0.5
+
+use_cot: false
+qa_uses_system_prompt: true
+
+intro: "You are an expert driver.\nInput:"
+
+input_sections:
+  images: "- multi-view images collected from the ego-vehicle (at most ${prompt.num_image_frames} frames, ${prompt.image_interval}s intervals, oldest first, up to the present timestep)"
+  past_traj: "- past trajectory (at most ${prompt.past_num_poses} steps, ${prompt.past_interval}s intervals), for trajectory prediction"
+  intent: "- Current high-level intent (string), for trajectory prediction"
+
+# The first line is the question input: it isn't one of the inputs that get dropped.
+task_text: |
+  - a question about the scene (string), for question answering
+  Task 1: Future Trajectory Prediction
+  When no question is asked, given the input, predict the optimal future trajectory (${prompt.pred_num_poses} steps, ${prompt.pred_interval}s intervals) of the ego vehicle.
+  Output format (raw text, not markdown or LaTeX):
+  Future ego trajectory:[[x_1, y_1], [x_2, y_2], ..., [x_${prompt.pred_num_poses}, y_${prompt.pred_num_poses}]]
+  Task 2: Question Answering
+  When a question is asked, answer it instead, from the images. Front, back, left and right are relative to the ego vehicle.
+  Output only the answer, as raw text with no explanation. When the question has lettered options, output only the letter of the correct option. When it has allowed answers, output exactly one of them.

@@ -1,5 +1,2 @@
 _target_: ad_vla.utils.img_utils.ImageResize
 
-size:
-  - ${data.image.height}
-  - ${data.image.width}

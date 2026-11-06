@@ -24,6 +24,7 @@ def instantiate_model(
     torch_dtype: str | None = "bfloat16",
     attn_implementation: str | None = "flash_attention_2",
     model_args: dict[str, Any] | None = None,
+    config_overrides: dict[str, Any] | None = None,
 ) -> PreTrainedModel | BaseTrajPlanner:
     """
     Hydra-friendly model factory.
@@ -33,11 +34,24 @@ def instantiate_model(
       - "from_pretrained": always use from_pretrained(ckpt_path)
       - "pretrained_submodules": use config_class.from_pretrained(base_model, **args) then from_pretrained_submodules
       - "scratch": config_class(**args) then model_class(model_config)
+
+    ``ckpt_path`` may be a local exported HF directory such as ``hf_ckpt/``.
+    The from_pretrained branch uses its saved configuration; ``model_args`` is
+    not forwarded as configuration overrides. Dtype and attention implementation
+    are passed explicitly. Use the class matching the checkpoint architecture.
+
+    ``config_overrides`` (from_pretrained only) updates the checkpoint's saved configuration
+    before the model is built, to warm-start a modified architecture from it; dict-valued
+    entries are merged one level deep, e.g. ``{"expert_cfg": {"camera_geometry": "ray_kv"}}``
+    keeps the saved expert_cfg and adds camera geometry. Weights the checkpoint lacks are
+    initialized by the model (FlowMatchingVLA keeps zero-initialized layers at zero).
     """
     model_args = model_args or {}
     # If someone passes a DictConfig by accident, normalize to plain dict
     if isinstance(model_args, DictConfig):
         model_args = OmegaConf.to_container(model_args, resolve=True)  # type: ignore
+    if isinstance(config_overrides, DictConfig):
+        config_overrides = OmegaConf.to_container(config_overrides, resolve=True)  # type: ignore
 
     model_class = get_class(class_path)
     dtype = _resolve_torch_dtype(torch_dtype)
@@ -59,14 +73,48 @@ def instantiate_model(
         print(
             f"Loading checkpoint: {model_class}, {dtype} dtype, {attn_implementation} attn_implementation."
         )
+        load_kwargs = {}
+        if config_overrides:
+            config = model_class.config_class.from_pretrained(ckpt_path)
+            for key, value in config_overrides.items():
+                current = getattr(config, key, None)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    value = {**current, **value}
+                setattr(config, key, value)
+            print(f"Config overrides on the checkpoint's config: {config_overrides}")
+            load_kwargs["config"] = config
         model = model_class.from_pretrained(
             ckpt_path,
             dtype=dtype,
             attn_implementation=attn_implementation,
+            **load_kwargs,
         )
         if hasattr(model, "tie_weights"):
             model.tie_weights()
+        if config_overrides:
+            # Modules added by the overrides are initialized by the model, not loaded: make sure
+            # nothing is left uninitialized.
+            bad = [
+                n
+                for n, t in (*model.named_parameters(), *model.named_buffers())
+                if not torch.isfinite(t).all()
+            ]
+            if bad:
+                raise ValueError(
+                    f"Non-finite weights after loading {ckpt_path} with config_overrides: {bad[:5]}"
+                )
+        if getattr(model, "insulate_backbone", False):
+            # from_pretrained leaves every loaded weight trainable; keep the backbone frozen as
+            # the model's __init__ does (otherwise fine-tuning from an hf_ckpt trains the VLM).
+            model.vlm.requires_grad_(False)
+        if hasattr(model, "calibration_mlp"):
+            # Calibration features enter this MLP as FP32; its embeddings are
+            # cast back to the backbone activation dtype by the model.
+            model.calibration_mlp.float()
         return model
+
+    if config_overrides:
+        raise ValueError("config_overrides applies only to init_mode=from_pretrained.")
 
     if init_mode == "pretrained_submodules":
         base_model = model_args.get("vlm_name_or_path", None)

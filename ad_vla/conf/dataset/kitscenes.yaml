@@ -1,0 +1,6 @@
+_target_: ad_vla.dataset.kitscenes.kitscenes_dataset.KITScenesDataset
+
+root: null
+
+
+sensors: "all_cams"

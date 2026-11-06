@@ -225,10 +225,7 @@ def _dst_to_src_rotation_homography(src_cal, dst_cal):
     src_rotation = np.asarray(src_rotation)
     dst_rotation = np.asarray(dst_rotation)
     return (
-        src_intrinsics
-        @ src_rotation.T
-        @ dst_rotation
-        @ np.linalg.inv(dst_intrinsics)
+        src_intrinsics @ src_rotation.T @ dst_rotation @ np.linalg.inv(dst_intrinsics)
     )
 
 
@@ -291,6 +288,8 @@ def _warp_hwc_by_dst_to_src_homography(
 
 @dataclass(frozen=True, slots=True)
 class CameraGeometryAugParams:
+    """One geometric perturbation: crop window (pixels) and mounting rotation (radians)."""
+
     top: int
     left: int
     crop_h: int
@@ -302,11 +301,24 @@ class CameraGeometryAugParams:
 
 @dataclass(frozen=True, slots=True)
 class ColorAugParams:
+    """One color jitter: torchvision adjust_* factors (``apply=False`` leaves the image as is)."""
+
     apply: bool
     brightness: float = 1.0
     contrast: float = 1.0
     saturation: float = 1.0
     hue: float = 0.0
+
+
+class PerCameraTransform:
+    """One image transform per camera, for the cameras of an entry's ``camera_sizes``."""
+
+    def __init__(self, default, cameras) -> None:
+        self.default = default
+        self.cameras = cameras
+
+    def for_camera(self, camera: str):
+        return self.cameras.get(camera, self.default)
 
 
 class ImageResize(nn.Module):
@@ -385,6 +397,22 @@ class CameraRigAugment(nn.Module):
     Geometry augmentation applies an aspect-preserving random crop, resizes to
     ``size``, and optionally synthesizes a small rotation about the camera's
     optical center. Appearance jitter does not alter calibration.
+
+    Each forward call samples independently unless explicit geometry/color
+    parameters are supplied; normal dataset calls do not share one perturbation
+    across cameras or history frames. Rotation uses a pinhole homography, not
+    depth-aware translation or distortion-aware rendering. ``size`` is [H, W],
+    constructor angle limits are degrees, and sampled angles are radians.
+
+    Args:
+        size: Output size [H, W].
+        p_geometry: Probability of a crop + rotation (otherwise only the resize).
+        max_crop_ratio: Largest fraction removed from each side length by the crop.
+        max_yaw_deg, max_pitch_deg, max_roll_deg: Uniform rotation ranges (+-, degrees).
+        p_color: Probability of color jitter.
+        brightness, contrast, saturation: Jitter factors drawn in [1 - v, 1 + v].
+        hue: Hue shift drawn in [-hue, hue] (at most 0.5).
+        padding_mode: ``grid_sample`` padding for pixels rotated in from outside the image.
     """
 
     requires_calibration = True
@@ -420,9 +448,7 @@ class CameraRigAugment(nn.Module):
         if not 0.0 <= hue <= 0.5:
             raise ValueError("hue must be between zero and 0.5.")
         if padding_mode not in {"zeros", "border", "reflection"}:
-            raise ValueError(
-                "padding_mode must be one of: zeros, border, reflection."
-            )
+            raise ValueError("padding_mode must be one of: zeros, border, reflection.")
 
         self.h, self.w = (int(value) for value in size)
         self.resize = v2.Resize((self.h, self.w), antialias=True)
@@ -440,6 +466,7 @@ class CameraRigAugment(nn.Module):
 
     @staticmethod
     def _uniform(low: float, high: float) -> float:
+        """One draw from U(low, high) with torch's RNG (seeded like the rest of training)."""
         return float(torch.empty(()).uniform_(low, high))
 
     def sample_geometry_params(self, h: int, w: int) -> CameraGeometryAugParams:
@@ -467,15 +494,11 @@ class CameraRigAugment(nn.Module):
             left=left,
             crop_h=crop_h,
             crop_w=crop_w,
-            yaw_rad=math.radians(
-                self._uniform(-self.max_yaw_deg, self.max_yaw_deg)
-            ),
+            yaw_rad=math.radians(self._uniform(-self.max_yaw_deg, self.max_yaw_deg)),
             pitch_rad=math.radians(
                 self._uniform(-self.max_pitch_deg, self.max_pitch_deg)
             ),
-            roll_rad=math.radians(
-                self._uniform(-self.max_roll_deg, self.max_roll_deg)
-            ),
+            roll_rad=math.radians(self._uniform(-self.max_roll_deg, self.max_roll_deg)),
         )
 
     def sample_color_params(self) -> ColorAugParams:
@@ -492,6 +515,7 @@ class CameraRigAugment(nn.Module):
 
     @staticmethod
     def _apply_color(img_hwc: torch.Tensor, params: ColorAugParams) -> torch.Tensor:
+        """Apply brightness, contrast, saturation and hue jitter to an HWC image."""
         if not params.apply:
             return img_hwc
         image_chw = img_hwc.permute(2, 0, 1)
@@ -507,6 +531,7 @@ class CameraRigAugment(nn.Module):
         image_h: int,
         image_w: int,
     ) -> None:
+        """Raise if the crop window does not fit in the source image."""
         if params.top < 0 or params.left < 0:
             raise ValueError("Crop offsets must be non-negative.")
         if params.crop_h <= 0 or params.crop_w <= 0:
@@ -524,6 +549,16 @@ class CameraRigAugment(nn.Module):
         geometry_params: CameraGeometryAugParams | None = None,
         color_params: ColorAugParams | None = None,
     ):
+        """Augment one HWC RGB image and return it with its updated calibration.
+
+        Args:
+            img: Image [H, W, 3] (tensor or array).
+            cal_dict: Its calibration (intrinsics, camera-to-ego rotation, ...).
+            geometry_params, color_params: Explicit perturbations; None samples new ones.
+
+        Returns:
+            The augmented image [size[0], size[1], 3] and the calibration that matches it.
+        """
         if not isinstance(img, torch.Tensor):
             img = torch.as_tensor(img)
         if img.ndim != 3 or img.shape[-1] != 3:

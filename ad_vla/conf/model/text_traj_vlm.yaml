@@ -1,5 +1,5 @@
 _target_: ad_vla.models.instantiate_model.instantiate_model
-class_path: ad_vla.models.text_traj_vlm.TextTrajVLM
+class_path: ad_vla.models.vlas.text_traj_vlm.TextTrajVLM
 init_mode: auto
 ckpt_path: null
 
