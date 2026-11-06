@@ -5,6 +5,12 @@ reads the camera images, the ego vehicle's recent path and a driving command, an
 seconds of driving. The repository trains, evaluates and tests these planners on Waymo E2E, NAVSIM,
 nuScenes, NVIDIA PhysicalAI-AV and KITScenes, with PyTorch Lightning and Hydra configs.
 
+It contains the implementation of
+[*Towards Zero-Shot Transfer Across Embodiments For Driving VLAs*](https://arxiv.org/abs/2609.02341)
+(WACV 2027): training on several datasets and camera rigs, and BEV-Forcing, an auxiliary loss that
+transfers the ground-plane layout of objects from a bird's-eye-view model into the VLA backbone
+(`examples/sft_ttvlm_bev_forcing`). If you use the code, please [cite the paper](#citation).
+
 **Two models**
 
 - **TextTrajVLM** writes the future waypoints as text (`(x, y)` pairs in metres, in the ego frame).
@@ -113,3 +119,19 @@ the [Waymo Open Dataset](https://waymo.com/open/), [nuScenes](https://www.nuscen
 [PhysicalAI-AV](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles),
 [Alpamayo](https://github.com/NVlabs/alpamayo), [SimpleBEV](https://github.com/aharley/simple_bev),
 [VGGT](https://github.com/facebookresearch/vggt) and [NuPlanQA](https://github.com/sungyeonparkk/NuPlanQA).
+
+## Citation
+
+If this code helps your research, please cite:
+
+```bibtex
+@inproceedings{azevedo2027zeroshot,
+  title         = {Towards Zero-Shot Transfer Across Embodiments For Driving {VLAs}},
+  author        = {Azevedo, Caio and Sabatini, Stefano and Hornauer, Sascha and Moutarde, Fabien},
+  booktitle     = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+  year          = {2027},
+  eprint        = {2609.02341},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV}
+}
+```
